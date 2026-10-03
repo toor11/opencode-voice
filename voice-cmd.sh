@@ -37,7 +37,7 @@ open_opencode_projects() {
 # "open firefox" / "launch brave" / ...: first installed match wins.
 open_browser() {
   local want="$1" prog
-  for prog in $want brave chromium firefox zen-browser librewolf google-chrome; do
+  for prog in $want firedragon brave chromium firefox zen-browser librewolf google-chrome; do
     if command -v "$prog" >/dev/null 2>&1; then
       if [ "${OC_VOICE_DRYRUN:-0}" = "1" ]; then
         echo "ACTION: launch $prog"
@@ -75,6 +75,11 @@ case "$NORM" in
     ;;
   *open*chromium*|*launch*chromium*|*start*chromium*)
     open_browser chromium
+    exit 0
+    ;;
+  *open*firedragon*|*launch*firedragon*|*start*firedragon*|\
+  *open*fire*dragon*)
+    open_browser firedragon
     exit 0
     ;;
 esac
