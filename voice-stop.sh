@@ -111,6 +111,14 @@ else
   rm -f "$RESF" "$ERRF" "$CONFF"
 fi
 
+# ---------------- spoken commands (shared) ----------------
+# Phrases like "open opencode and start working" run an action instead of
+# normal delivery (works in both ask and type modes).
+if [ -n "${TEXT// }" ] && "$DIR/voice-cmd.sh" "$TEXT"; then
+  log "handled as voice command"
+  exit 0
+fi
+
 # ---------------- deliver (shared) ----------------
 log "heard: $TEXT (conf: ${CONF:-n/a})"
 [ -z "${TEXT// }" ] && { log "abort: empty transcript"; exit 0; }
