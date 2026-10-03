@@ -144,6 +144,16 @@ ANS="$("$OPENCODE_BIN" run --continue "$TEXT" 2>>"$LOG")"
 log "answer chars: ${#ANS}"
 echo "$ANS" > "$REPLY_TXT"
 echo "$ANS"
+# Remember which session this went to, so voice-watch.sh (or the
+# "show session" voice command) can open the TUI attached to it.
+# Sessions live per project directory; voice uses ~/Projects.
+SESF=$SPOOL/voice.session
+SESID="$(cd "$HOME/Projects" 2>/dev/null && "$OPENCODE_BIN" session list \
+  --format json -n 1 2>/dev/null | jq -r '.[0].id // empty' 2>/dev/null)"
+if [ -n "$SESID" ]; then
+  echo "$SESID" > "$SESF"
+  log "session: $SESID"
+fi
 
 SPOKEN="$("$DIR/.venv/bin/python" "$DIR/clean_for_speech.py" "$REPLY_TXT" 2>>"$LOG")"
 [ -z "${SPOKEN// }" ] && { log "abort: nothing speakable"; exit 0; }

@@ -19,6 +19,7 @@
 #   OC_VOICE_DRYRUN=1 ./voice-cmd.sh "open firefox"
 set -u
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 OPENCODE_BIN="/home/user/.opencode/bin/opencode"
 PROJECTS_DIR="$HOME/Projects"
 
@@ -55,6 +56,9 @@ VERBS="open launch start run"
 # Exact full-phrase commands: normalized string -> action.
 declare -A PHRASE_ACTION
 PHRASE_ACTION["open opencode and start working"]="opencode_work"
+PHRASE_ACTION["show session"]="watch_session"
+PHRASE_ACTION["show opencode session"]="watch_session"
+PHRASE_ACTION["open session"]="watch_session"
 # ("launch opencode" / "start opencode" parse via the verb+alias grammar
 # and land on the same opencode action through the executor below.)
 
@@ -166,6 +170,19 @@ launch_opencode_projects() {
   nohup kitty --directory "$PROJECTS_DIR" "$OPENCODE_BIN" >/dev/null 2>&1 &
 }
 
+watch_session() {
+  # Open the TUI attached to the latest voice session (voice-watch.sh).
+  if [ "$DRYRUN" = "1" ]; then
+    echo "COMMAND: watch_session"
+    echo "ACTION: run_voice_watch"
+    echo "SCRIPT: $SCRIPT_DIR/voice-watch.sh"
+    return 0
+  fi
+  notify "Opening voice session"
+  log "watch session"
+  nohup "$SCRIPT_DIR/voice-watch.sh" >/dev/null 2>&1 &
+}
+
 # ---------------- main ----------------
 TEXT="${1:-}"
 NORM="$(normalize_text "$TEXT")"
@@ -183,6 +200,7 @@ log "parsed action=$ACTION target=${TARGET:-none}"
 case "$ACTION" in
   launch_app)    launch_app "$TARGET" ;;
   opencode_work) launch_opencode_projects ;;
+  watch_session) watch_session ;;
   *) log "unknown action: $ACTION"; exit 1 ;;
 esac
 exit 0

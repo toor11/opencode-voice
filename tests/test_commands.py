@@ -89,6 +89,16 @@ class TestValidCommands(unittest.TestCase):
             self.assertEqual(f.get("COMMAND"), "opencode.work", text)
             self.assertIn("opencode", f.get("EXECUTABLE", ""), text)
 
+    def test_watch_session(self):
+        for text in ("show session",
+                     "show opencode session",
+                     "open session"):
+            rc, f = run(text)
+            self.assertEqual(rc, 0, text)
+            self.assertEqual(f.get("COMMAND"), "watch_session", text)
+            self.assertTrue(f.get("SCRIPT", "").endswith("voice-watch.sh"),
+                            text)
+
     def test_missing_app_reports_not_installed(self):
         rc, f = run("open brave", path=STUBS_EMPTY)
         self.assertEqual(rc, 0)

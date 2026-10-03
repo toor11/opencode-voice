@@ -221,6 +221,7 @@ Then `hyprctl reload` and confirm with
 | `voice-start.sh` | Key-press: launch streamer, stop any playing reply |
 | `voice-stop.sh` | Key-release: STOP the stream, wait for result, ask/type, speak (legacy branch kept under `OC_VOICE_LEGACY=1`) |
 | `voice-cmd.sh` | Spoken command dispatcher: transcript → safe registry parser → whitelisted app launch (exit 0 = handled, 1 = normal delivery) |
+| `voice-watch.sh` | Opens kitty with the OpenCode TUI attached to the latest voice session (`opencode --session`, also via "show session") |
 | `voice-auto.sh` | Hands-free: single press, streamer self-endpoints on silence, then the normal release path |
 | `voice_stream.py` | Socket client: mic (`parec`→`arecord`) → PCM frames; SIGUSR1=STOP, SIGTERM=cancel, `--auto` endpoints locally |
 | `voice-daemon.py` + `voice-daemon.sh` | Persistent model server: socket IPC + chunked ASR + VAD gate + confidence + normalization + cancellation (`--legacy-file-mode` re-enables the WAV spool) |
@@ -293,6 +294,17 @@ OC_VOICE_DRYRUN=1 ./voice-cmd.sh "open spotify"   # shows COMMAND/TARGET/EXECUTA
 bash -n voice-cmd.sh                               # syntax check
 .venv/bin/python -m unittest tests.test_commands   # parser suite: add your phrases here
 ```
+
+### Chatbot mode with a visible session
+
+`SUPER+SHIFT+space` (ask mode) talks to OpenCode headless and speaks the
+reply -- the conversation accumulates in one session in `~/Projects`.
+To **see** it, run `voice-watch.sh` (bind it to a key, e.g.
+`SUPER+ALT+space`), or just say **"show session"** on your next
+recording. It opens kitty with the OpenCode TUI attached to your latest
+voice chat (`opencode --session <id>`), so you can read history, scroll,
+and type follow-ups. Every ask also records its session id to
+`/tmp/oc-voice/voice.session` (plus the daemon log) for scripting.
 
 ### Security note
 
