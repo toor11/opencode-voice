@@ -1,0 +1,11 @@
+[Unit]
+Description=OpenCode voice transcription daemon (persistent whisper)
+After=default.target
+
+[Service]
+ExecStart=/home/user/Projects/opencode-voice/voice-daemon.sh
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

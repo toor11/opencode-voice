@@ -40,7 +40,27 @@ if [ ! -f "$WAV" ] || [ "$SIZE" -lt 5000 ]; then
   exit 0
 fi
 
-TEXT="$("$DIR/.venv/bin/python" "$DIR/transcribe.py" "$WAV" 2>>"$LOG")"
+SPOOL=/tmp/oc-voice
+mkdir -p "$SPOOL"
+TEXT=""
+# Prefer the persistent daemon (model stays loaded, no per-release reload).
+if systemctl --user is-active --quiet opencode-voice 2>/dev/null; then
+  rm -f "$SPOOL/res.txt"
+  cp "$WAV" "$SPOOL/req.tmp" && mv "$SPOOL/req.tmp" "$SPOOL/req.wav"
+  for _ in $(seq 1 600); do
+    [ -f "$SPOOL/res.txt" ] && break
+    sleep 0.1
+  done
+  if [ -f "$SPOOL/res.txt" ]; then
+    TEXT="$(cat "$SPOOL/res.txt")"
+    log "transcribed via daemon"
+  else
+    log "WARN: daemon timeout, one-shot fallback"
+  fi
+fi
+if [ -z "${TEXT// }" ]; then
+  TEXT="$("$DIR/.venv/bin/python" "$DIR/transcribe.py" "$WAV" 2>>"$LOG")"
+fi
 rm -f "$WAV"
 log "heard: $TEXT"
 [ -z "${TEXT// }" ] && { log "abort: empty transcript"; exit 0; }

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Transcribe a 16kHz mono wav with local faster-whisper base.en (GPU if usable)."""
+"""Transcribe a 16kHz mono wav with local faster-whisper small.en (GPU if usable)."""
 import glob
 import os
 import sys
@@ -16,7 +16,7 @@ if _nvlibs:
 from faster_whisper import WhisperModel
 
 
-MODEL = "base.en"
+MODEL = "small.en"
 # Vocabulary bias for this setup: tech terms the user dictates often.
 INITIAL_PROMPT = (
     "OpenCode on Garuda Linux with Hyprland. "
@@ -38,7 +38,7 @@ def transcribe_wav(model: WhisperModel, wav: str) -> str:
     segments, _ = model.transcribe(
         wav,
         language="en",
-        beam_size=5,
+        beam_size=1,
         vad_filter=True,
         initial_prompt=INITIAL_PROMPT,
     )

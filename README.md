@@ -20,10 +20,17 @@ Holding `SUPER` again interrupts a speaking reply (barge-in).
 ```
 key press   -> voice-start.sh : pw-record 16kHz mono to /tmp/oc-voice.wav
 key release -> voice-stop.sh  : stop record
-                               -> transcribe.py (faster-whisper, GPU if present)
+                               -> voice-daemon.py (persistent whisper, model
+                                  loaded once, CUDA int8) via /tmp/oc-voice
+                                  queue; falls back to one-shot transcribe.py
                                -> ask:  opencode run --continue, piper TTS, pw-play
                                   type: wtype "<text> " into focused window
 ```
+
+The daemon (`opencode-voice` systemd user service) keeps `small.en` resident
+on the GPU, so transcription answers in ~1s instead of paying a 5s model
+reload per key release. Manage it with
+`systemctl --user status|restart opencode-voice`.
 
 Steps are logged to `/tmp/oc-voice.log` (`heard: ...`, `device: cuda/cpu`,
 `answer chars: ...`). Voice conversations accumulate in one OpenCode session;
@@ -77,7 +84,9 @@ Then `hyprctl reload` and confirm with
 |---|---|
 | `voice-start.sh` | Key-press: start mic capture, stop any playing reply |
 | `voice-stop.sh` | Key-release: stop, transcribe, ask/type, speak |
-| `transcribe.py` | faster-whisper `base.en`, CUDA int8 with CPU fallback, beam 5, VAD filter, tech-vocabulary prompt |
+| `transcribe.py` | One-shot fallback: faster-whisper `small.en`, CUDA int8 with CPU retry, beam 1, VAD filter, tech-vocabulary prompt |
+| `voice-daemon.py` + `voice-daemon.sh` | Persistent model server + CUDA-env wrapper (see above) |
+| `opencode-voice.service` | systemd user unit; install to `~/.config/systemd/user/`, `enable --now` |
 | `clean_for_speech.py` | Strips code blocks/URLs/markdown before TTS (900-char cap) |
 | `hypr-voice.conf` | Documentation of the binds (real binds live in `hyprland.lua`) |
 | `voices/` | Piper voice files (gitignored, see install) |
