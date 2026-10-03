@@ -15,26 +15,41 @@ your machine**: local speech-to-text, local text-to-speech.
 Bare `space` is deliberately *not* used — it would fire on every word you type.
 Holding `SUPER` again interrupts a speaking reply (barge-in).
 
-## How it works
+## Architecture
 
 ```
-key press   -> voice-start.sh : pw-record 16kHz mono to /tmp/oc-voice.wav
-key release -> voice-stop.sh  : stop record
-                               -> voice-daemon.py (persistent whisper, model
-                                  loaded once, CUDA int8) via /tmp/oc-voice
-                                  queue; falls back to one-shot transcribe.py
-                               -> ask:  opencode run --continue, piper TTS, pw-play
-                                  type: wtype "<text> " into focused window
+key press   -> voice-start.sh : pw-record 16kHz mono to /tmp/oc-voice.wav,
+                                stop any playing reply (barge-in)
+key release -> voice-stop.sh  : stop recorder, tap-guard, transcribe, then:
+  ask:  opencode run --continue -> clean_for_speech.py -> piper TTS -> pw-play
+  type: wtype "<text> " into the focused window
 ```
 
-The daemon (`opencode-voice` systemd user service) keeps `small.en` resident
-on the GPU, so transcription answers in ~1s instead of paying a 5s model
-reload per key release. Manage it with
-`systemctl --user status|restart opencode-voice`.
+Transcription is served by `voice-daemon.py`, a persistent process that loads
+whisper `small.en` **once** at startup (CUDA int8, ~650MB VRAM) and answers in
+~1s per utterance instead of paying a ~5s model reload on every key release.
+Decoding is tuned for voice commands: `beam_size=1`, Silero VAD filter (skips
+silence, kills hallucinations), English-only, plus an initial prompt seeded
+with this setup's vocabulary (OpenCode, Hyprland, Garuda…).
 
-Steps are logged to `/tmp/oc-voice.log` (`heard: ...`, `device: cuda/cpu`,
-`answer chars: ...`). Voice conversations accumulate in one OpenCode session;
-list it with `opencode session list` from `~/Projects`.
+Handoff is file-based in `/tmp/oc-voice`:
+
+| File | Writer | Meaning |
+|---|---|---|
+| `req.wav` | `voice-stop.sh` (via atomic `.tmp` + rename) | new job |
+| `proc.wav` | daemon (renamed from `req.wav`) | job being transcribed |
+| `res.txt` | daemon (via atomic `.tmp` + rename) | transcript; `voice-stop.sh` polls up to 60s |
+
+If the service is down or times out, `voice-stop.sh` falls back to one-shot
+`transcribe.py` (same model/settings, loads on demand). Every step appends to
+`/tmp/oc-voice.log` (`heard: ...`, `device: cuda/cpu`, `answer chars: ...`),
+so a silent failure always leaves a trace.
+
+Manage the daemon with `systemctl --user status opencode-voice` and
+`journalctl --user -u opencode-voice` (look for `ready`).
+
+Voice conversations accumulate in one OpenCode session (`--continue`); list it
+with `opencode session list` from `~/Projects`.
 
 ## Requirements
 
@@ -62,7 +77,7 @@ curl -sL -o voices/en_US-lessac-medium.onnx "$base/en_US-lessac-medium.onnx"
 curl -sL -o voices/en_US-lessac-medium.onnx.json "$base/en_US-lessac-medium.onnx.json"
 ```
 
-Whisper models (`medium.en`) download automatically on first use into the
+Whisper models (`small.en`) download automatically on first use into the
 HuggingFace cache (`~/.cache`).
 
 Wire the keys in `~/.config/hypr/hyprland.lua` (Hyprland v0.55+ uses the Lua
@@ -99,7 +114,7 @@ Then `hyprctl reload` and confirm with
 | Empty transcript | Mic muted: `pactl set-source-mute @DEFAULT_SOURCE@ 0`. Speak 2–3s, start ~0.5s after pressing |
 | `opencode: command not found` in log | Hyprland exec has a minimal PATH; script uses the absolute `$HOME/.opencode/bin/opencode` |
 | CUDA lib errors | Handled: `LD_LIBRARY_PATH` is exported before Python starts (setting it inside Python does nothing), plus a CPU retry |
-| VRAM pressure (2GB cards) | `medium.en` peaks ~1.5GB; overflow falls back to CPU automatically |
+| VRAM pressure (2GB cards) | `small.en` holds ~650MB resident; overflow falls back to CPU automatically |
 | App ignores dictation | `wtype` works in native Wayland apps only, not XWayland windows |
 
 ## License
