@@ -64,9 +64,12 @@ case "$NORM" in
     open_opencode_projects
     exit 0
     ;;
-  *open*firefox*|*launch*firefox*|*start*firefox*)
-    # "open firefox" (falls back to any installed browser)
-    open_browser firefox
+  *open*fire*|*launch*fire*|*start*fire*|\
+  *open*fox*|*launch*fox*|*start*fox*)
+    # "open firefox" -- small.en usually hears "OpenFire Fox",
+    # "OpenFire folks", "OpenFallingFox.com", so match the fire/fox
+    # fragments rather than the exact brand spelling.
+    open_browser firedragon
     exit 0
     ;;
   *open*brave*|*launch*brave*|*start*brave*)
@@ -84,4 +87,5 @@ case "$NORM" in
     ;;
 esac
 
+log "no match: $NORM"
 exit 1
