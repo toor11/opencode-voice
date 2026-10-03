@@ -252,6 +252,7 @@ or `the` also match):
 | Start Chromium | Opens Chromium |
 | Open VS Code | Opens VS Code (`code`; reports "not installed" if absent) |
 | Open OpenCode and start working | Opens kitty in `~/Projects` running opencode (also "launch/start opencode") |
+| Show session | Opens kitty with the OpenCode TUI attached to your latest voice chat (also "show opencode session", "open session") |
 
 Anything else -- `"tell me about firefox"`, `"fix firefox"`,
 `"open the Firefox configuration file"` -- is not a command and goes to
