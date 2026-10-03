@@ -248,7 +248,11 @@ class Session:
 
     def send(self, obj: dict) -> None:
         with self.send_lock:
-            proto.send_json(self.conn, obj)
+            try:
+                proto.send_json(self.conn, obj)
+            except OSError as e:
+                self.log(f"send failed ({obj.get('type')}): {e}")
+                raise
 
     def bump_generation(self) -> int:
         with self.gen_lock:
@@ -405,6 +409,7 @@ class Session:
         self.bump_generation()  # invalidate any in-flight ASR output
         self.cancel_ev.set()
         self.stop_ev.set()
+        self.asr_log("cancel")
         try:
             self.send({"type": "cancelled", "request_id": self.rid})
         except OSError:
@@ -474,6 +479,7 @@ class Session:
             return
         new = len(self.buf) - self.last_partial_end
         if new < int(self.min_new * self.sr):
+            self.asr_log("partial skipped: insufficient new audio")
             return
         gen = self.current_generation()
         tail = self.buf.tail(self.window_s)

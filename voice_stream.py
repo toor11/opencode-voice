@@ -119,19 +119,28 @@ class Streamer:
     # -- server reader ------------------------------------------------------
     def _reader(self) -> None:
         assert self.sock is not None
-        while True:
-            try:
-                msg = proto.read_json(self.sock)
-            except proto.ConnClosed:
-                self.inbox.put({"type": "_disconnected"})
-                return
-            except (proto.ProtocolError, OSError) as e:
-                self.inbox.put({"type": "_error",
-                                "message": f"socket read failed: {e}"})
-                return
-            self.inbox.put(msg)
-            if msg.get("type") in ("result", "cancelled", "error", "busy"):
-                return
+        try:
+            while True:
+                try:
+                    msg = proto.read_json(self.sock)
+                except proto.ConnClosed:
+                    log(f"stream {self.rid}: reader: disconnected")
+                    self.inbox.put({"type": "_disconnected"})
+                    return
+                except (proto.ProtocolError, OSError) as e:
+                    log(f"stream {self.rid}: reader: read failed: {e!r}")
+                    self.inbox.put({"type": "_error",
+                                    "message": f"socket read failed: {e}"})
+                    return
+                self.inbox.put(msg)
+                if msg.get("type") in ("result", "cancelled", "error", "busy"):
+                    log(f"stream {self.rid}: reader: terminal {msg.get('type')}")
+                    return
+        except BaseException as e:  # never die silently: _drain waits on inbox
+            log(f"stream {self.rid}: reader: unexpected death: {e!r}")
+            self.inbox.put({"type": "_error",
+                            "message": f"reader died: {e!r}"})
+            raise
 
     def _drain(self, deadline_s: float = 90.0) -> None:
         """Consume server messages; returns when a terminal one arrives.
@@ -245,6 +254,13 @@ class Streamer:
         else:
             return self.fail("daemon busy")
 
+        assert sock is not None
+        # Stream phase blocks: clear the handshake timeout BEFORE the reader
+        # thread starts, otherwise its first recv can inherit the stale 10s
+        # timeout and die mid-recording on any utterance longer than that.
+        sock.settimeout(None)
+        self.sock = sock
+
         reader = threading.Thread(target=self._reader, daemon=True)
         reader.start()
 
@@ -263,7 +279,6 @@ class Streamer:
             # ignore stray partials (none expected this early)
 
         assert sock is not None
-        sock.settimeout(None)  # handshake used timeouts; stream phase blocks
         self.sock = sock
 
         try:
@@ -310,11 +325,17 @@ class Streamer:
                         end_reason = reason
                         break
                 # A daemon error mid-stream aborts the recording early.
+                # Internal reader statuses (_error/_disconnected) are fatal
+                # too: the connection is dead, recording on is pointless.
+                # Anything else (e.g. a partial preview) is re-queued, never
+                # dropped -- _drain still sees it after STOP.
                 try:
                     msg = self.inbox.get_nowait()
-                    if msg.get("type") in ("error", "busy"):
+                    if msg.get("type") in ("error", "busy", "_error",
+                                           "_disconnected"):
                         return self._abort_mic(
                             mic, msg.get("message", "daemon error"))
+                    self.inbox.put(msg)
                 except queue.Empty:
                     pass
         finally:
