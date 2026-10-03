@@ -47,6 +47,29 @@ def transcribe_wav(model: WhisperModel, wav: str) -> str:
 
 def main() -> None:
     wav = sys.argv[1] if len(sys.argv) > 1 else "/tmp/oc-voice.wav"
+    # Pipeline VAD gate first: silence exits fast WITHOUT loading the model
+    # (saves the ~5s reload that used to happen on every empty utterance).
+    if os.environ.get("OC_VOICE_NO_VAD_GATE") != "1":
+        try:
+            from vad_gate import TRIM_SAVINGS_S, analyze, write_speech_only
+
+            vad = analyze(wav)
+            if not vad.has_speech:
+                print(f"vad: silence ({vad.total_s:.2f}s), skipped whisper",
+                      file=sys.stderr)
+                print("")
+                return
+            if vad.total_s - vad.speech_s >= TRIM_SAVINGS_S:
+                trimmed = wav + ".speech.wav"
+                write_speech_only(wav, trimmed)
+                wav = trimmed
+                print(f"vad: speech {vad.speech_s:.2f}s/{vad.total_s:.2f}s, "
+                      f"trimmed", file=sys.stderr)
+        except SystemExit:
+            raise
+        except Exception as e:
+            print(f"vad gate failed ({e}), transcribing full clip",
+                  file=sys.stderr)
     model, device = load_model()
     try:
         text = transcribe_wav(model, wav)

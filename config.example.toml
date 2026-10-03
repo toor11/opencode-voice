@@ -1,0 +1,76 @@
+# opencode-voice configuration. Copy to ~/.config/opencode-voice/config.toml
+# (or $XDG_CONFIG_HOME/opencode-voice/config.toml) and uncomment what you
+# want to change. Everything is optional -- built-in defaults apply.
+# Environment variables (OC_VOICE_SOCKET, OC_VOICE_MODEL, OC_VOICE_DEVICE,
+# OC_VOICE_LANGUAGE, OC_VOICE_CHUNK_MS, OC_VOICE_STREAM_MS,
+# OC_VOICE_VAD_THRESHOLD, OC_VOICE_VAD_MIN_SPEECH_MS,
+# OC_VOICE_VAD_MIN_SILENCE_MS, OC_VOICE_VAD_PAD_MS, OC_VOICE_LEGACY)
+# override both.
+
+[server]
+# "auto" = $XDG_RUNTIME_DIR/opencode-voice.sock, else /tmp/oc-voice/voice.sock
+socket = "auto"
+# Serve the old req.wav/res.txt spool protocol alongside the socket.
+legacy_file_mode = false
+spool_dir = "/tmp/oc-voice"
+
+[audio]
+sample_rate = 16000
+channels = 1
+chunk_ms = 100
+
+[transcription]
+model = "small.en"
+device = "auto"  # auto | cuda | cpu
+compute_type = "int8"
+language = "en"
+beam_size = 1
+# Confidence = duration-weighted mean of exp(segment avg_logprob), a quality
+# signal not a calibrated probability. Low results are flagged, never dropped.
+confidence_enabled = true
+low_confidence_threshold = 0.55
+
+[vad]
+enabled = true
+threshold = 0.5
+min_speech_duration_ms = 250
+# Short pauses between words survive: spans split only after this much quiet.
+min_silence_duration_ms = 500
+speech_pad_ms = 200
+min_speech_s = 0.25
+trim_savings_s = 0.5
+
+[streaming]
+# Partial cadence. faster-whisper transcribe() is array-at-once, so partials
+# re-transcribe a bounded recent window -- this is pseudo-streaming, honest.
+enabled = true
+interval_ms = 2000
+window_s = 8.0
+min_new_speech_s = 1.0
+
+# Deterministic post-ASR fixes for predictable misrecognitions ("open code"
+# -> "OpenCode"). No LLM. A user list replaces these defaults wholesale;
+# enabled = false disables everything.
+[normalization]
+enabled = true
+replaces = [
+  ["open code", "OpenCode"],
+  ["get hub", "GitHub"],
+  ["get lab", "GitLab"],
+  ["hip land", "Hyprland"],
+  ["hi pr land", "Hyprland"],
+  ["dock er", "Docker"],
+  ["cue wen", "Qwen"],
+  ["q wen", "Qwen"],
+  ["key me", "Kimi"],
+  ["post gress", "PostgreSQL"],
+  ["postgress", "PostgreSQL"],
+  ["my sequel", "MySQL"],
+  ["node j s", "Node.js"],
+]
+
+# CANCEL is answered by the socket reader in milliseconds; the ASR worker
+# abandons its output so a cancelled request never emits a late result.
+# enabled = false makes CANCEL behave like STOP (still finalizes).
+[cancellation]
+enabled = true

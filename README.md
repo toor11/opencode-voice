@@ -12,38 +12,129 @@ your machine**: local speech-to-text, local text-to-speech.
 | `SUPER + space` | Types the transcript at the cursor (dictation, via `wtype`) |
 | `SUPER + SHIFT + space` | Sends transcript to OpenCode (`run --continue`) and speaks the reply |
 
+Hands-free alternative: bind a key to `voice-auto.sh` — single press, speak,
+pause (~1.2s silence) to auto-submit, no release needed. Same `OC_VOICE_MODE`
+(`ask` default, `type` for dictation). The streamer also accepts `--auto`
+directly (`voice_stream.py --auto`: local VAD endpointing, SIGUSR1 still
+works as a manual submit).
+
 Bare `space` is deliberately *not* used — it would fire on every word you type.
 Holding `SUPER` again interrupts a speaking reply (barge-in).
 
 ## Architecture
 
 ```
-key press   -> voice-start.sh : pw-record 16kHz mono to /tmp/oc-voice.wav,
+key press   -> voice-start.sh : launch voice_stream.py (mic -> socket),
                                 stop any playing reply (barge-in)
-key release -> voice-stop.sh  : stop recorder, tap-guard, transcribe, then:
+key release -> voice-stop.sh  : SIGUSR1 = STOP, wait for result, then:
   ask:  opencode run --continue -> clean_for_speech.py -> piper TTS -> pw-play
   type: wtype "<text> " into the focused window
 ```
 
-Transcription is served by `voice-daemon.py`, a persistent process that loads
-whisper `small.en` **once** at startup (CUDA int8, ~650MB VRAM) and answers in
-~1s per utterance instead of paying a ~5s model reload on every key release.
-Decoding is tuned for voice commands: `beam_size=1`, Silero VAD filter (skips
-silence, kills hallucinations), English-only, plus an initial prompt seeded
-with this setup's vocabulary (OpenCode, Hyprland, Garuda…).
+`voice-daemon.py` is a persistent process: whisper `small.en` loads **once**
+at startup (CUDA int8, ~650MB VRAM — fits the GTX 1050 2GB) and every request
+reuses that single instance. No per-utterance reload, no second model.
 
-Handoff is file-based in `/tmp/oc-voice`:
+```
+              Hyprland hotkey
+                    │
+                    ▼
+             voice-start/client
+                    │ Unix domain socket
+                    ▼
+             ┌──────────────┐
+             │ voice-daemon │
+             │              │
+Microphone ─►│ audio buffer │
+             │      │       │
+             │      ▼       │
+             │     VAD      │  silence skipped, speech trimmed
+             │      │       │
+             │      ▼       │
+             │ chunked ASR  │  partials every ~2s (recent 8s window)
+             │      │       │
+             │      ▼       │
+             │ partial text │
+             └──────┬───────┘
+                    │ final transcript (authoritative)
+                    ▼
+              OpenCode / wtype
+```
 
-| File | Writer | Meaning |
-|---|---|---|
-| `req.wav` | `voice-stop.sh` (via atomic `.tmp` + rename) | new job |
-| `proc.wav` | daemon (renamed from `req.wav`) | job being transcribed |
-| `res.txt` | daemon (via atomic `.tmp` + rename) | transcript; `voice-stop.sh` polls up to 60s |
+VAD runs **before** Whisper (`vad_gate.py`, Silero `silero_vad_v6.onnx` on
+CPU — bundled with faster-whisper, no new dependency). Silence returns empty
+without waking the GPU (~0.14s, zero ASR calls); mostly-silence buffers are
+trimmed in-memory first. Decoding keeps `beam_size=1`, `vad_filter=True` as
+second-stage safety, English-only, plus an initial prompt seeded with this
+setup's vocabulary (OpenCode, Hyprland, Garuda…).
 
-If the service is down or times out, `voice-stop.sh` falls back to one-shot
-`transcribe.py` (same model/settings, loads on demand). Every step appends to
-`/tmp/oc-voice.log` (`heard: ...`, `device: cuda/cpu`, `answer chars: ...`),
-so a silent failure always leaves a trace.
+### Streaming (chunked pseudo-streaming, honest)
+
+faster-whisper's `transcribe()` is array-at-once: it cannot emit tokens
+incrementally, so true token streaming is not possible on this stack. Instead
+the daemon transcribes a bounded recent window (`streaming.window_s`, default
+8s) every `streaming.interval_ms` (default 2s) once enough *new* speech
+arrived — cost per partial stays flat (~0.5s on the GTX 1050) instead of
+growing with recording length. A `partial` **replaces** the previous one;
+only `result` is authoritative. Partials fire only while speech is ongoing
+(recent 1.5s); during pauses the last partial stands, so pause-hallucinations
+(prompt echoes) don't flicker. The final result is always one full transcribe
+of the VAD-trimmed buffer.
+
+Measured on GTX 1050 / `small.en` int8 (`python benchmark.py --socket`):
+first partial ~2.5–2.8s into speech, finalization ~0.5s after STOP,
+cancel reaction ~1ms (`benchmark.py --socket --cancel-test`).
+
+### Confidence (a signal, not a grade)
+
+Every result carries `confidence`: the duration-weighted mean of
+`exp(segment avg_logprob)` from faster-whisper (e.g. partial 0.72, final 0.75
+on the reference clip). Segments without probability data yield `null`, never
+a fabricated number. Below `low_confidence_threshold` (0.55) the text is
+still returned and typed — flagged (`low_confidence: true`, "You said
+(unsure)" notification, `conf: … low` in the log), never silently dropped and
+never "corrected" by an LLM.
+
+### Normalization (deterministic, no LLM)
+
+After ASR, before OpenCode: ordered word-boundary phrase fixes for known
+misrecognitions (`open code`→`OpenCode`, `get hub`→`GitHub`, `cue wen`→`Qwen`,
+…). Multi-word defaults only, so ordinary English (`rust is fast`, `code`,
+`docker run hello`) passes through untouched. Configure in
+`[normalization]` (`enabled`, `replaces` — a user list replaces defaults);
+`OC_VOICE_NORMALIZE=0` disables.
+
+### Cancellation
+
+The session runs a socket reader plus an ASR worker: the reader answers
+`CANCEL` immediately (measured 1ms) while the worker abandons its in-flight
+transcribe and never emits a late result — request B can't hear request A.
+Pressing the push-to-talk key during playback still uses barge-in; a raw
+`kill -TERM <streamer-pid>` cancels a recording (`cancelled by daemon` path).
+`[cancellation] enabled = false` makes CANCEL behave like STOP.
+
+### Socket IPC (no polling, no WAV)
+
+Default socket: `$XDG_RUNTIME_DIR/opencode-voice.sock`, fallback
+`/tmp/oc-voice/voice.sock` (`OC_VOICE_SOCKET` or `[server] socket` overrides).
+Framing is `kind(1B) + len(4B BE) + payload`: kind `0x01` = JSON control,
+kind `0x02` = raw s16le mono 16kHz PCM (no base64). One recording session =
+one connection = one `request_id` (`20261003-170000-abc123de`); a second
+concurrent session gets `{"type":"busy"}` and is disconnected. Messages:
+`start` → `started`, binary `audio…`, `stop` → `partial…` → `result`
+(`text` + `timings`), `cancel` → `cancelled`, plus `error`. Length-delimited
+frames tolerate partial reads and coalescing; disconnects free the busy slot
+so the next press works.
+
+`/tmp/oc-voice` now only holds tiny rendezvous files (`stream.pid`,
+`stream.req`, `stream.res`/`stream.conf`/`stream.err`); no `req.wav`/`res.txt`
+in normal operation. Every request logs `[voice] request=… started /
+first_partial=…s confidence=… / stop / final confidence=… norm=…
+final_latency=…s total=…s` to the journal and `/tmp/oc-voice.log`.
+
+Legacy WAV spool (`req.wav` → `proc.wav` → `res.txt` polling) is kept as a
+fallback: `OC_VOICE_LEGACY=1` on the scripts + `--legacy-file-mode`
+(or `[server] legacy_file_mode = true`) on the daemon.
 
 Manage the daemon with `systemctl --user status opencode-voice` and
 `journalctl --user -u opencode-voice` (look for `ready`).
@@ -53,9 +144,12 @@ with `opencode session list` from `~/Projects`.
 
 ## Requirements
 
-- Garuda/Arch Linux, Hyprland (Wayland), PipeWire, `wtype`, `pw-record`/`pw-play`
+- Garuda/Arch Linux, Hyprland (Wayland), PipeWire, `wtype`, `parec` (mic
+  streaming; `arecord` fallback), `pw-play`
 - Python 3.12 venv (see install), NVIDIA GPU optional (GTX 1050 2GB tested)
 - OpenCode CLI on PATH (`~/.opencode/bin/opencode`)
+- No new Python dependencies: socket client/config/tests use stdlib + numpy
+  (stdlib `tomllib` reads the config; Python ≥3.11 required for that)
 
 ## Install
 
@@ -97,24 +191,65 @@ Then `hyprctl reload` and confirm with
 
 | File | Purpose |
 |---|---|
-| `voice-start.sh` | Key-press: start mic capture, stop any playing reply |
-| `voice-stop.sh` | Key-release: stop, transcribe, ask/type, speak |
-| `transcribe.py` | One-shot fallback: faster-whisper `small.en`, CUDA int8 with CPU retry, beam 1, VAD filter, tech-vocabulary prompt |
-| `voice-daemon.py` + `voice-daemon.sh` | Persistent model server + CUDA-env wrapper (see above) |
+| `voice-start.sh` | Key-press: launch streamer, stop any playing reply |
+| `voice-stop.sh` | Key-release: STOP the stream, wait for result, ask/type, speak (legacy branch kept under `OC_VOICE_LEGACY=1`) |
+| `voice-auto.sh` | Hands-free: single press, streamer self-endpoints on silence, then the normal release path |
+| `voice_stream.py` | Socket client: mic (`parec`→`arecord`) → PCM frames; SIGUSR1=STOP, SIGTERM=cancel, `--auto` endpoints locally |
+| `voice-daemon.py` + `voice-daemon.sh` | Persistent model server: socket IPC + chunked ASR + VAD gate + confidence + normalization + cancellation (`--legacy-file-mode` re-enables the WAV spool) |
+| `asr.py` | Shared single-model `Transcriber` + honest confidence math |
+| `normalizer.py` | Deterministic phrase fixes (word-boundary, ordered, disableable) |
+| `proto.py` | Socket framing + control messages (shared by daemon, client, tests, benchmark) |
+| `config.py` + `config.example.toml` | TOML config + env overrides + socket resolution |
+| `vad_gate.py` | Pipeline VAD: speech/silence gate + speech-only trim (file CLI + in-memory API) |
+| `transcribe.py` | One-shot VAD-gated fallback used by legacy mode |
+| `benchmark.py` | Latency/RTF/confidence reports: in-process, live-daemon (`--socket`), cancel reaction (`--socket --cancel-test`) |
+| `tests/` | `unittest` suite, CUDA-free (mocked model): `python -m unittest discover -s tests` |
 | `opencode-voice.service` | systemd user unit; install to `~/.config/systemd/user/`, `enable --now` |
 | `clean_for_speech.py` | Strips code blocks/URLs/markdown before TTS (900-char cap) |
 | `hypr-voice.conf` | Documentation of the binds (real binds live in `hyprland.lua`) |
 | `voices/` | Piper voice files (gitignored, see install) |
+
+## Configuration
+
+Optional. Copy `config.example.toml` to `~/.config/opencode-voice/config.toml`
+and tune: socket path, chunk size, model/device, VAD (`threshold`,
+`min_silence_duration_ms`, `speech_pad_ms`, … — pauses between words survive
+by default), streaming cadence (`interval_ms`, `window_s`), confidence
+(`confidence_enabled`, `low_confidence_threshold`), normalization vocabulary
+(`enabled`, `replaces`), cancellation. Every key is also
+settable via `OC_VOICE_*` env vars (see `config.py`). Defaults match the
+previous behavior, so no config is needed for a standard install.
+
+## Performance
+
+```bash
+python benchmark.py /tmp/oc-voice-last.wav            # in-process simulation
+python benchmark.py --socket /tmp/oc-voice-last.wav   # through the live daemon
+python benchmark.py --socket --cancel-test clip.wav   # CANCEL responsiveness
+```
+
+Reports audio duration, partial count, first-partial latency, final latency
+(time from audio end → transcript), compute total, RTF, and average/final
+confidence. The number that matters for feel is **final latency** — currently
+~0.5s on the GTX 1050. Daemon logs use the same vocabulary per request:
+`started`, `first_partial=…s confidence=…`, `stop`, `final
+confidence=… final_latency=…s total=…s` (transcript text itself is never
+logged server-side).
 
 ## Troubleshooting
 
 | Symptom | Cause / fix |
 |---|---|
 | Nothing happens at all | Binds live in `hyprland.lua`, not `hyprland.conf`. Check `hyprctl binds -j` for `space` entries |
-| Empty transcript | Mic muted: `pactl set-source-mute @DEFAULT_SOURCE@ 0`. Speak 2–3s, start ~0.5s after pressing |
+| `Voice error: daemon unavailable` | Daemon down: `systemctl --user status opencode-voice`, `journalctl --user -u opencode-voice` (look for `ready`). Socket lives at `$XDG_RUNTIME_DIR/opencode-voice.sock`, fallback `/tmp/oc-voice/voice.sock` |
+| Socket permission errors | Socket dir must be user-writable; `OC_VOICE_SOCKET` can point elsewhere. Never TCP — no ports involved |
+| `microphone unavailable` in log | Neither `parec` (pipewire-pulse) nor `arecord` could open the mic; `pactl set-source-mute @DEFAULT_SOURCE@ 0`, check `pactl info` |
+| CUDA lib errors | `LD_LIBRARY_PATH` is exported before Python starts (daemon wrapper, stop script, benchmark re-exec); plus CPU fallback |
+| CUDA unavailable at runtime | Daemon logs `cuda failed…, using cpu` and keeps serving — slower, same protocol |
+| VRAM pressure (2GB cards) | One resident `small.en` int8 (~650MB); partial windows are bounded (8s) so cost stays flat |
+| Empty transcript | Silence-only rooms return empty by design (no GPU wake). Otherwise: mic muted, or speak 2–3s starting ~0.5s after pressing |
+| "You said (unsure)" notification | Confidence below threshold (`low_confidence_threshold`, 0.55) — text still typed, just flagged. Tune or disable via `[transcription]` / `OC_VOICE_LOW_CONF` |
 | `opencode: command not found` in log | Hyprland exec has a minimal PATH; script uses the absolute `$HOME/.opencode/bin/opencode` |
-| CUDA lib errors | Handled: `LD_LIBRARY_PATH` is exported before Python starts (setting it inside Python does nothing), plus a CPU retry |
-| VRAM pressure (2GB cards) | `small.en` holds ~650MB resident; overflow falls back to CPU automatically |
 | App ignores dictation | `wtype` works in native Wayland apps only, not XWayland windows |
 
 ## License
