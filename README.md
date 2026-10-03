@@ -77,7 +77,7 @@ Then `hyprctl reload` and confirm with
 |---|---|
 | `voice-start.sh` | Key-press: start mic capture, stop any playing reply |
 | `voice-stop.sh` | Key-release: stop, transcribe, ask/type, speak |
-| `transcribe.py` | faster-whisper `medium.en`, CUDA int8 with CPU fallback, beam 5, VAD filter, tech-vocabulary prompt |
+| `transcribe.py` | faster-whisper `base.en`, CUDA int8 with CPU fallback, beam 5, VAD filter, tech-vocabulary prompt |
 | `clean_for_speech.py` | Strips code blocks/URLs/markdown before TTS (900-char cap) |
 | `hypr-voice.conf` | Documentation of the binds (real binds live in `hyprland.lua`) |
 | `voices/` | Piper voice files (gitignored, see install) |
