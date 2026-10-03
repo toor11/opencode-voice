@@ -1,0 +1,4 @@
+.venv/
+voices/
+__pycache__/
+*.pyc
