@@ -240,39 +240,66 @@ Then `hyprctl reload` and confirm with
 
 ## Voice commands
 
-Certain phrases run an action instead of being sent to OpenCode:
+Certain phrases run an action instead of being sent to OpenCode. Say the
+app name with any of **open / launch / start / run** (optional `please`
+or `the` also match):
 
-```text
-Open FireDragon          (also "open firefox" -- this is Garuda)
-Launch Brave
-Start Chromium
-Open VS Code
-Open OpenCode and start working   (kitty in ~/Projects running opencode)
-```
+| Say | Does |
+|---|---|
+| Open FireDragon | Opens FireDragon (also matches "open firefox" -- on Garuda, Firefox *is* FireDragon, including ASR variants like "OpenFire Fox") |
+| Launch Brave | Opens Brave |
+| Start Chromium | Opens Chromium |
+| Open VS Code | Opens VS Code (`code`; reports "not installed" if absent) |
+| Open OpenCode and start working | Opens kitty in `~/Projects` running opencode (also "launch/start opencode") |
 
-Matching is deterministic, not NLU: after normalization the text must be
-`[please] (open|launch|start|run) [the] <app>` (or one exact
-full-phrase command), matched against a registry of app aliases.
-`"tell me about firefox"` or `"fix firefox"` are not commands and go to
-OpenCode normally.
+Anything else -- `"tell me about firefox"`, `"fix firefox"`,
+`"open the Firefox configuration file"` -- is not a command and goes to
+OpenCode normally. If a registered app isn't installed you get a
+"not installed" notification instead of a different app opening.
 
-Security: the transcript never defines what executes. `voice-cmd.sh`
-resolves speech to a registered target and only runs the registered
-executable (verified with `command -v` first). Arbitrary shell commands
-are intentionally unsupported -- there is no `eval`, no `sh -c`, no
-substitution of transcript text. Saying `"open firefox"` when it is not
-installed reports "not installed" instead of launching another browser.
+### Add your own commands
 
-Adding an app is one line in `voice-cmd.sh`:
+One line in `voice-cmd.sh`, in the registry section:
 
 ```bash
-register_app vscode "VS Code" code "vscode|vs code|visual studio code"
+register_app spotify "Spotify" spotify "spotify|spotify music"
 ```
 
-(canonical name, display name, executable, `|`-separated aliases), then
-`open vscode` / `open vs code` / `launch visual studio code` work. Test
-with `OC_VOICE_DRYRUN=1 ./voice-cmd.sh "open vscode"` and add cases to
-`tests/test_commands.py`.
+The four fields are: canonical name, display name (for notifications),
+executable, and `|`-separated aliases. Then these work automatically:
+
+```text
+open spotify
+launch spotify music
+please start spotify
+```
+
+Tips:
+
+- **Aliases cover ASR mishearings.** Whisper rarely returns brand names
+  cleanly ("firefox" arrives as "OpenFire Fox"), so add every variant
+  you see in `/tmp/oc-voice.log` (`heard:` lines) as an alias.
+- **Keep aliases specific.** The remainder after the verb must equal an
+  alias exactly, so `"open code"` never triggers anything and normal
+  dictation can't misfire -- but don't register bare words like `code`.
+- **Special actions** (like opening opencode inside kitty in a fixed
+  directory) need a small function plus routing in the executor, following
+  the existing `launch_opencode_projects` example.
+
+Verify before pushing:
+
+```bash
+OC_VOICE_DRYRUN=1 ./voice-cmd.sh "open spotify"   # shows COMMAND/TARGET/EXECUTABLE, launches nothing
+bash -n voice-cmd.sh                               # syntax check
+.venv/bin/python -m unittest tests.test_commands   # parser suite: add your phrases here
+```
+
+### Security note
+
+The transcript never defines what executes: speech resolves to a
+registered target and only the registered executable runs (checked with
+`command -v` first). Arbitrary shell commands are intentionally
+unsupported -- no `eval`, no `sh -c`, no substitution of transcript text.
 
 ## Configuration
 
