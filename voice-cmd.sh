@@ -34,11 +34,47 @@ open_opencode_projects() {
   nohup kitty --directory "$dir" "$OPENCODE_BIN" >/dev/null 2>&1 &
 }
 
+# "open firefox" / "launch brave" / ...: first installed match wins.
+open_browser() {
+  local want="$1" prog
+  for prog in $want brave chromium firefox zen-browser librewolf google-chrome; do
+    if command -v "$prog" >/dev/null 2>&1; then
+      if [ "${OC_VOICE_DRYRUN:-0}" = "1" ]; then
+        echo "ACTION: launch $prog"
+        return 0
+      fi
+      notify "Opening $prog"
+      log "opening $prog"
+      if command -v hyprctl >/dev/null 2>&1; then
+        hyprctl dispatch exec "$prog" 2>/dev/null && return 0
+      fi
+      nohup "$prog" >/dev/null 2>&1 &
+      return 0
+    fi
+  done
+  notify "No browser found ($want)"
+  log "no browser found for '$want'"
+  return 0  # handled (don't feed it to opencode as a question)
+}
+
 case "$NORM" in
   *opencode*work*|*opencode*start*|*launch*opencode*|\
   *open\ code*work*|*open\ code*start*)
     # "open opencode and start working", "launch opencode", ...
     open_opencode_projects
+    exit 0
+    ;;
+  *open*firefox*|*launch*firefox*|*start*firefox*)
+    # "open firefox" (falls back to any installed browser)
+    open_browser firefox
+    exit 0
+    ;;
+  *open*brave*|*launch*brave*|*start*brave*)
+    open_browser brave
+    exit 0
+    ;;
+  *open*chromium*|*launch*chromium*|*start*chromium*)
+    open_browser chromium
     exit 0
     ;;
 esac
