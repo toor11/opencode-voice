@@ -74,8 +74,9 @@ fi
 if [ -z "${TEXT// }" ]; then
   TEXT="$("$DIR/.venv/bin/python" "$DIR/transcribe.py" "$WAV" 2>>"$LOG")"
 fi
+cp -f "$WAV" /tmp/oc-voice-last.wav 2>/dev/null || true
 rm -f "$WAV"
-log "heard: $TEXT"
+log "heard ($SIZE bytes): $TEXT"
 [ -z "${TEXT// }" ] && { log "abort: empty transcript"; exit 0; }
 
 notify-send -t 3000 "You said" "$TEXT" 2>/dev/null || true
