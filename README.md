@@ -298,7 +298,10 @@ bash -n voice-cmd.sh                               # syntax check
 ### Chatbot mode with a visible session
 
 `SUPER+SHIFT+space` (ask mode) talks to OpenCode headless and speaks the
-reply -- the conversation accumulates in one session in `~/Projects`.
+reply -- the conversation continues the latest session pinned to
+`~/Projects` (`OC_VOICE_DIR` overrides). Pinning matters: without it the
+chat would land in the catch-all `global` project whose sessions even
+`opencode session list` cannot see.
 To **see** it, run `voice-watch.sh` (bind it to a key, e.g.
 `SUPER+ALT+space`), or just say **"show session"** on your next
 recording. It opens kitty with the OpenCode TUI attached to your latest

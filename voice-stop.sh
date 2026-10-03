@@ -136,9 +136,20 @@ if [ "$MODE" = "type" ]; then
   exit 0
 fi
 
-# ask mode: run through opencode, keep conversing in last session
+# ask mode: run through opencode, keep conversing in last session.
+# Voice chats live in one pinned project directory (default ~/Projects):
+# Hyprland launches this script with $HOME as CWD, which would scatter
+# chats into the invisible "global" project whose sessions even
+# `session list` cannot see. Pinning keeps ask + tracking + watch agreed.
 REPLY_TXT=/tmp/oc-reply.txt
 REPLY_WAV=/tmp/oc-reply.wav
+VOICE_DIR="${OC_VOICE_DIR:-$HOME/Projects}"
+if [ -d "$VOICE_DIR" ]; then
+  cd "$VOICE_DIR" || log "WARN: cannot cd to $VOICE_DIR"
+else
+  log "WARN: voice dir missing: $VOICE_DIR (using $PWD)"
+  VOICE_DIR="$PWD"
+fi
 ANS="$("$OPENCODE_BIN" run --continue "$TEXT" 2>>"$LOG")"
 [ -z "${ANS// }" ] && ANS="Sorry, I got no answer."
 log "answer chars: ${#ANS}"
@@ -146,9 +157,8 @@ echo "$ANS" > "$REPLY_TXT"
 echo "$ANS"
 # Remember which session this went to, so voice-watch.sh (or the
 # "show session" voice command) can open the TUI attached to it.
-# Sessions live per project directory; voice uses ~/Projects.
 SESF=$SPOOL/voice.session
-SESID="$(cd "$HOME/Projects" 2>/dev/null && "$OPENCODE_BIN" session list \
+SESID="$("$OPENCODE_BIN" session list \
   --format json -n 1 2>/dev/null | jq -r '.[0].id // empty' 2>/dev/null)"
 if [ -n "$SESID" ]; then
   echo "$SESID" > "$SESF"
