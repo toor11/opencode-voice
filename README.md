@@ -9,8 +9,8 @@ your machine**: local speech-to-text, local text-to-speech.
 
 | Hold | Release does |
 |---|---|
-| `SUPER + space` | Sends transcript to OpenCode (`run --continue`) and speaks the reply |
-| `SUPER + SHIFT + space` | Types the transcript at the cursor (dictation, via `wtype`) |
+| `SUPER + space` | Types the transcript at the cursor (dictation, via `wtype`) |
+| `SUPER + SHIFT + space` | Sends transcript to OpenCode (`run --continue`) and speaks the reply |
 
 Bare `space` is deliberately *not* used — it would fire on every word you type.
 Holding `SUPER` again interrupts a speaking reply (barge-in).
