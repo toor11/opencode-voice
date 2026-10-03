@@ -31,11 +31,24 @@ if [ -f "$PIDF" ]; then
   rm -f "$PIDF"
   sleep 0.3
 fi
+# $PIDF holds the `timeout` wrapper PID; make sure its pw-record child died too
+pkill -f "pw-record.*oc-voice[.]wav" 2>/dev/null || true
 
 # accidental tap guard (< ~0.4s of audio)
 SIZE="$(stat -c%s "$WAV" 2>/dev/null || echo 0)"
 if [ ! -f "$WAV" ] || [ "$SIZE" -lt 5000 ]; then
   log "abort: wav missing/too small (size=$SIZE)"
+  rm -f "$WAV"
+  exit 0
+fi
+
+# runaway guard: a missed key-release leaves pw-record running for minutes.
+# 16kHz mono 16-bit is ~31KB/s, so 3MB is ~95s; anything bigger is discarded
+# instead of wedging the GPU for minutes and typing hallucinated text.
+MAXSIZE=3000000
+if [ "$SIZE" -gt "$MAXSIZE" ]; then
+  log "abort: wav too large (size=$SIZE ~$((SIZE / 31000))s), likely missed key-release; discarded"
+  notify-send -t 4000 "Voice: recording too long (~$((SIZE / 31000))s)" "Missed key-release? Discarded." 2>/dev/null || true
   rm -f "$WAV"
   exit 0
 fi
