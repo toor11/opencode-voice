@@ -199,17 +199,51 @@ class Streamer:
         self._write(self.pid_file, str(os.getpid()))
         self._write(self.req_file, self.rid)
 
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        try:
-            sock.connect(self.sock_path)
-        except OSError as e:
-            return self.fail(f"daemon unavailable at {self.sock_path} ({e})")
-        self.sock = sock
-        try:
-            proto.send_json(sock, {"type": "start", "request_id": self.rid,
-                                   "sample_rate": self.sr})
-        except OSError as e:
-            return self.fail(f"start rejected ({e})")
+        sock = None
+        for attempt in range(5):
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                sock.connect(self.sock_path)
+            except OSError as e:
+                return self.fail(
+                    f"daemon unavailable at {self.sock_path} ({e})")
+            self.sock = sock
+            try:
+                proto.send_json(sock, {"type": "start",
+                                       "request_id": self.rid,
+                                       "sample_rate": self.sr})
+                # Peek at the first reply without consuming partials logic.
+                sock.settimeout(10)
+                first = proto.read_json(sock)
+            except (OSError, proto.ConnClosed, proto.ProtocolError) as e:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+                return self.fail(f"start rejected ({e})")
+            except socket.timeout:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+                return self.fail("daemon did not answer start")
+            if first.get("type") == "started":
+                self.inbox.put(first)
+                break
+            # Busy: a previous session is still tearing down; reconnect and
+            # retry rather than failing a rapid re-press.
+            try:
+                sock.close()
+            except OSError:
+                pass
+            if first.get("type") != "busy" or attempt == 4:
+                return self.fail(first.get("message", "daemon refused start")
+                                 if isinstance(first, dict)
+                                 else "daemon refused start")
+            log(f"stream {self.rid}: daemon busy, retry {attempt + 1}/5")
+            time.sleep(0.3)
+        else:
+            return self.fail("daemon busy")
 
         reader = threading.Thread(target=self._reader, daemon=True)
         reader.start()
@@ -227,6 +261,10 @@ class Streamer:
             if msg.get("type") in ("error", "_disconnected", "_error"):
                 return self.fail(msg.get("message", "daemon refused start"))
             # ignore stray partials (none expected this early)
+
+        assert sock is not None
+        sock.settimeout(None)  # handshake used timeouts; stream phase blocks
+        self.sock = sock
 
         try:
             mic = spawn_mic(self.sr, int(self.cfg["audio"]["channels"]))

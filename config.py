@@ -29,6 +29,7 @@ DEFAULTS = {
         "sample_rate": 16000,
         "channels": 1,
         "chunk_ms": 100,          # mic -> socket frame size
+        "max_buffer_s": 120.0,   # daemon drops audio older than this
     },
     "transcription": {
         "model": "small.en",
@@ -55,10 +56,14 @@ DEFAULTS = {
         "trim_savings_s": 0.5,   # rewrite wav/buffer only if it saves >= this
     },
     "streaming": {
-        "enabled": True,       # False = buffer everything, single final only
-        "interval_ms": 2000,     # how often to attempt a partial transcript
-        "window_s": 8.0,         # partials transcribe at most this much audio
-        "min_new_speech_s": 1.0, # ... and only if this much new speech arrived
+        # Default OFF on GTX 1050-class GPUs: partial ASR costs extra
+        # inference and can delay the final. FINAL_ONLY = one inference
+        # per utterance. Enable explicitly for preview text.
+        "enabled": False,
+        "interval_ms": 3000,     # ... how often to attempt a partial
+        "window_s": 4.0,         # partials transcribe at most this much audio
+        "min_new_speech_s": 2.0, # ... and only if this much new speech arrived
+        "max_pending": 1,        # at most one pending partial (coalesced)
     },
     "normalization": {
         "enabled": True,

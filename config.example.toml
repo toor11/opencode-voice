@@ -41,12 +41,16 @@ min_speech_s = 0.25
 trim_savings_s = 0.5
 
 [streaming]
-# Partial cadence. faster-whisper transcribe() is array-at-once, so partials
-# re-transcribe a bounded recent window -- this is pseudo-streaming, honest.
-enabled = true
-interval_ms = 2000
-window_s = 8.0
-min_new_speech_s = 1.0
+# FINAL_ONLY is the default: buffer audio, run exactly ONE inference at STOP.
+# Partial ASR performs additional inference and can delay the final on
+# low-VRAM / low-compute GPUs, so enable it only for preview text.
+enabled = false
+# Only relevant when enabled (LOW_COST_PARTIAL): small bounded window on a
+# slow cadence, skipped whenever the model is busy, never delaying final.
+interval_ms = 3000
+window_s = 4.0
+min_new_speech_s = 2.0
+max_pending = 1
 
 # Deterministic post-ASR fixes for predictable misrecognitions ("open code"
 # -> "OpenCode"). No LLM. A user list replaces these defaults wholesale;

@@ -78,6 +78,7 @@ def make_silence(seconds=1.0, sr=16000):
 
 def test_config(**over):
     cfg = load_config("/nonexistent-config.toml")
+    cfg["streaming"]["enabled"] = True
     cfg["streaming"]["interval_ms"] = 200
     cfg["streaming"]["min_new_speech_s"] = 0.3
     cfg["streaming"]["window_s"] = 4.0
@@ -359,6 +360,26 @@ class TestRobustness(ServerCase):
             s.close()
             self.stop_server()
 
+    def test_asr_failure_reports_error_not_hang(self):
+        class BoomModel(FakeModel):
+            def transcribe(self, audio, **kwargs):
+                raise RuntimeError("simulated CUDA failure")
+
+        self.start_server(BoomModel(), vad={"enabled": False},
+                          streaming={"enabled": False})
+        s = self.connect()
+        try:
+            proto.send_json(s, {"type": "start", "request_id": "boom"})
+            proto.read_json(s)
+            proto.send_audio(s, make_sine(0.4))
+            proto.send_json(s, {"type": "stop", "request_id": "boom"})
+            s.settimeout(15)
+            m = proto.read_json(s)
+            self.assertEqual(m["type"], "error")
+        finally:
+            s.close()
+            self.stop_server()
+
     def test_stale_socket_file_reused(self):
         # Simulate a crashed daemon: dead file at the socket path.
         with open(self.sock, "w") as f:
@@ -444,6 +465,146 @@ class TestConfidenceAndNormalization(ServerCase):
             self.assertEqual(m["text"], "open code on get hub")
         finally:
             s.close()
+            self.stop_server()
+
+
+class TestScheduling(ServerCase):
+    def test_final_only_default_single_inference(self):
+        # New default: streaming disabled -> no partials, exactly ONE
+        # model call per utterance (plus CPU VAD, which is not inference).
+        model = FakeModel("one shot")
+        self.start_server(model, vad={"enabled": False},
+                          streaming={"enabled": False})
+        s = self.connect()
+        try:
+            proto.send_json(s, {"type": "start", "request_id": "fo1"})
+            proto.read_json(s)
+            for _ in range(6):
+                proto.send_audio(s, make_sine(0.2))
+                time.sleep(0.15)
+            proto.send_json(s, {"type": "stop", "request_id": "fo1"})
+            partials = 0
+            while True:
+                m = proto.read_json(s)
+                if m["type"] == "partial":
+                    partials += 1
+                elif m["type"] == "result":
+                    break
+            self.assertEqual(partials, 0)
+            self.assertEqual(m["text"], "one shot")
+            self.assertEqual(len(model.calls), 1)
+            self.assertFalse(m["timings"]["partials_enabled"])
+        finally:
+            s.close()
+            self.stop_server()
+
+    def test_no_overlapping_asr(self):
+        # Slow model + fast cadence: partials must skip, never overlap.
+        import threading as _t
+
+        class CountingModel(FakeModel):
+            def __init__(self, *a, **k):
+                super().__init__(*a, **k)
+                self.live = 0
+                self.peak = 0
+                self.plock = _t.Lock()
+
+            def transcribe(self, audio, **kwargs):
+                with self.plock:
+                    self.live += 1
+                    self.peak = max(self.peak, self.live)
+                try:
+                    return super().transcribe(audio, **kwargs)
+                finally:
+                    with self.plock:
+                        self.live -= 1
+
+        model = CountingModel("slow", delay=0.6)
+        self.start_server(model, vad={"enabled": False})
+        s = self.connect()
+        try:
+            proto.send_json(s, {"type": "start", "request_id": "ov1"})
+            proto.read_json(s)
+            for _ in range(8):
+                proto.send_audio(s, make_sine(0.2))
+                time.sleep(0.15)
+            proto.send_json(s, {"type": "stop", "request_id": "ov1"})
+            while True:
+                m = proto.read_json(s)
+                if m["type"] == "result":
+                    break
+            self.assertEqual(m["text"], "slow")
+            self.assertEqual(model.peak, 1,
+                             "ASR calls overlapped on one model")
+        finally:
+            s.close()
+            self.stop_server()
+
+    def test_stale_partial_never_leaks_into_next_session(self):
+        # Cancel while a partial is in-flight, then verify the next
+        # session only ever sees its own text.
+        model = FakeModel("stale-words", delay=1.0)
+        self.start_server(model, vad={"enabled": False})
+        a = self.connect()
+        try:
+            proto.send_json(a, {"type": "start", "request_id": "STALE-A"})
+            proto.read_json(a)
+            for _ in range(4):
+                proto.send_audio(a, make_sine(0.2))
+                time.sleep(0.3)
+            # A partial ASR job is now likely in-flight; cancel it.
+            proto.send_json(a, {"type": "cancel", "request_id": "STALE-A"})
+            got = proto.read_json(a)
+            self.assertEqual(got["type"], "cancelled")
+            a.settimeout(2.5)
+            try:
+                late = proto.read_json(a)
+                self.assertNotIn("stale-words", str(late),
+                                 f"stale output leaked: {late}")
+            except (proto.ConnClosed, socket.timeout, OSError):
+                pass
+        finally:
+            a.close()
+        model.text = "fresh-words"
+        b = self.connect()
+        try:
+            proto.send_json(b, {"type": "start", "request_id": "FRESH-B"})
+            proto.read_json(b)
+            proto.send_audio(b, make_sine(0.4))
+            proto.send_json(b, {"type": "stop", "request_id": "FRESH-B"})
+            texts = []
+            while True:
+                m = proto.read_json(b)
+                if m["type"] in ("partial", "result"):
+                    texts.append(m["text"])
+                if m["type"] == "result":
+                    break
+            self.assertTrue(all("stale-words" not in t for t in texts))
+            self.assertEqual(m["text"], "fresh-words")
+        finally:
+            b.close()
+            self.stop_server()
+
+    def test_rapid_stop_start(self):
+        model = FakeModel("quick")
+        self.start_server(model, vad={"enabled": False},
+                          streaming={"enabled": False})
+        try:
+            for i in range(3):
+                s = self.connect()
+                rid = f"rapid-{i}"
+                proto.send_json(s, {"type": "start", "request_id": rid})
+                proto.read_json(s)
+                proto.send_audio(s, make_sine(0.3))
+                proto.send_json(s, {"type": "stop", "request_id": rid})
+                while True:
+                    m = proto.read_json(s)
+                    if m["type"] == "result":
+                        break
+                s.close()
+                self.assertEqual(m["request_id"], rid)
+                self.assertEqual(m["text"], "quick")
+        finally:
             self.stop_server()
 
 

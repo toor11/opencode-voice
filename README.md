@@ -40,21 +40,23 @@ reuses that single instance. No per-utterance reload, no second model.
                     │
                     ▼
              voice-start/client
-                    │ Unix domain socket
+                    │ Unix domain socket (100ms PCM frames, never blocked by ASR)
                     ▼
              ┌──────────────┐
              │ voice-daemon │
              │              │
-Microphone ─►│ audio buffer │
+Microphone ─►│ audio buffer │  bounded deque, O(1) append, cheap tail
              │      │       │
              │      ▼       │
              │     VAD      │  silence skipped, speech trimmed
              │      │       │
              │      ▼       │
-             │ chunked ASR  │  partials every ~2s (recent 8s window)
+             │ scheduled    │  FINAL_ONLY default: ONE inference at STOP
+             │   ASR        │  optional LOW_COST_PARTIAL preview window
              │      │       │
              │      ▼       │
-             │ partial text │
+             │ confidence + │  exp(avg_logprob), then deterministic fixes
+             │ normalizer   │
              └──────┬───────┘
                     │ final transcript (authoritative)
                     ▼
@@ -68,22 +70,35 @@ trimmed in-memory first. Decoding keeps `beam_size=1`, `vad_filter=True` as
 second-stage safety, English-only, plus an initial prompt seeded with this
 setup's vocabulary (OpenCode, Hyprland, Garuda…).
 
-### Streaming (chunked pseudo-streaming, honest)
+### Streaming: audio streams, ASR is scheduled (chunked, honest)
 
-faster-whisper's `transcribe()` is array-at-once: it cannot emit tokens
-incrementally, so true token streaming is not possible on this stack. Instead
-the daemon transcribes a bounded recent window (`streaming.window_s`, default
-8s) every `streaming.interval_ms` (default 2s) once enough *new* speech
-arrived — cost per partial stays flat (~0.5s on the GTX 1050) instead of
-growing with recording length. A `partial` **replaces** the previous one;
-only `result` is authoritative. Partials fire only while speech is ongoing
-(recent 1.5s); during pauses the last partial stands, so pause-hallucinations
-(prompt echoes) don't flicker. The final result is always one full transcribe
-of the VAD-trimmed buffer.
+Three distinct things, kept distinct: **audio streaming** (mic→socket→buffer
+is genuinely incremental and never blocks on ASR), **incremental ASR**
+(optional bounded-window previews), **token streaming** (not available —
+faster-whisper 1.2.1/CTranslate2 4.8.2 `transcribe()` is array-at-once with
+no interruption API; there is no token callback to use).
 
-Measured on GTX 1050 / `small.en` int8 (`python benchmark.py --socket`):
-first partial ~2.5–2.8s into speech, finalization ~0.5s after STOP,
-cancel reaction ~1ms (`benchmark.py --socket --cancel-test`).
+Default is **FINAL_ONLY**: the daemon buffers audio and runs exactly ONE
+inference at STOP — no GPU work while you speak. This is the fastest mode on
+the GTX 1050 and the right default for 2GB VRAM.
+
+**LOW_COST_PARTIAL** (`[streaming] enabled = true`) adds preview text: a
+small 4s window every 3s once ≥2s of *new* speech arrived, skipped whenever
+the model is busy (at most one pending partial, coalesced — overlapping
+inference is impossible by construction: one worker, one model lock, one
+`busy` flag). Partials never delay the final: STOP discards pending preview
+work and prioritizes the single authoritative transcribe. A `partial`
+**replaces** the previous one; only `result` counts. Partials fire only
+while speech is ongoing (recent 1.5s), so pauses don't flicker prompt echoes.
+
+Measured on GTX 1050 / `small.en` int8 (`python benchmark.py --compare`,
+same 3.67s clip): FINAL_ONLY = 1 inference / 0.81s compute; PARTIAL = 2
+inferences / 0.93s compute; identical final text and confidence. Partials
+cost GPU work and buy only preview text — hence off by default.
+
+The audio buffer is a bounded deque (120s cap): O(1) append, tail extraction
+copies only the window, one full copy at STOP. The old
+`np.concatenate(all_chunks)`-per-partial pattern is gone.
 
 ### Confidence (a signal, not a grade)
 
@@ -104,11 +119,21 @@ misrecognitions (`open code`→`OpenCode`, `get hub`→`GitHub`, `cue wen`→`Qw
 `[normalization]` (`enabled`, `replaces` — a user list replaces defaults);
 `OC_VOICE_NORMALIZE=0` disables.
 
-### Cancellation
+### Cancellation (two levels, honest)
 
-The session runs a socket reader plus an ASR worker: the reader answers
-`CANCEL` immediately (measured 1ms) while the worker abandons its in-flight
-transcribe and never emits a late result — request B can't hear request A.
+The session runs a socket reader plus an ASR worker, guarded by a generation
+counter. **Level 1 — logical (always works):** the reader answers `CANCEL`
+immediately (measured 1ms) while the worker abandons in-flight work; every
+ASR job captures its generation and output from a stale generation is
+discarded before any send — a cancelled request can never emit a late result,
+and request B can't hear request A. **Level 2 — compute: not available.**
+faster-whisper/CTranslate2 expose no interruption API (`generate()` is a
+blocking C++ call; a Python Event cannot preempt a CUDA kernel), so an
+in-flight inference runs to completion and is discarded — no new work starts.
+No worker-process isolation either, deliberately: reloading `small.en` costs
+~2.2s and risks dual VRAM residency on the 2GB card for no latency win
+(the reply itself is already instant).
+
 Pressing the push-to-talk key during playback still uses barge-in; a raw
 `kill -TERM <streamer-pid>` cancels a recording (`cancelled by daemon` path).
 `[cancellation] enabled = false` makes CANCEL behave like STOP.
@@ -120,7 +145,9 @@ Default socket: `$XDG_RUNTIME_DIR/opencode-voice.sock`, fallback
 Framing is `kind(1B) + len(4B BE) + payload`: kind `0x01` = JSON control,
 kind `0x02` = raw s16le mono 16kHz PCM (no base64). One recording session =
 one connection = one `request_id` (`20261003-170000-abc123de`); a second
-concurrent session gets `{"type":"busy"}` and is disconnected. Messages:
+concurrent session gets `{"type":"busy"}` and is disconnected — except the
+client retries `start` a few times first, so a rapid re-press right after a
+result lands connects instead of failing. Messages:
 `start` → `started`, binary `audio…`, `stop` → `partial…` → `result`
 (`text` + `timings`), `cancel` → `cancelled`, plus `error`. Length-delimited
 frames tolerate partial reads and coalescing; disconnects free the busy slot
@@ -197,6 +224,7 @@ Then `hyprctl reload` and confirm with
 | `voice_stream.py` | Socket client: mic (`parec`→`arecord`) → PCM frames; SIGUSR1=STOP, SIGTERM=cancel, `--auto` endpoints locally |
 | `voice-daemon.py` + `voice-daemon.sh` | Persistent model server: socket IPC + chunked ASR + VAD gate + confidence + normalization + cancellation (`--legacy-file-mode` re-enables the WAV spool) |
 | `asr.py` | Shared single-model `Transcriber` + honest confidence math |
+| `audio_buffer.py` | Bounded deque audio buffer (O(1) append, cheap tail, one copy at STOP) |
 | `normalizer.py` | Deterministic phrase fixes (word-boundary, ordered, disableable) |
 | `proto.py` | Socket framing + control messages (shared by daemon, client, tests, benchmark) |
 | `config.py` + `config.example.toml` | TOML config + env overrides + socket resolution |
@@ -214,7 +242,8 @@ Then `hyprctl reload` and confirm with
 Optional. Copy `config.example.toml` to `~/.config/opencode-voice/config.toml`
 and tune: socket path, chunk size, model/device, VAD (`threshold`,
 `min_silence_duration_ms`, `speech_pad_ms`, … — pauses between words survive
-by default), streaming cadence (`interval_ms`, `window_s`), confidence
+by default), streaming mode (`enabled`, `interval_ms`, `window_s`,
+`min_new_speech_s` — FINAL_ONLY by default), confidence
 (`confidence_enabled`, `low_confidence_threshold`), normalization vocabulary
 (`enabled`, `replaces`), cancellation. Every key is also
 settable via `OC_VOICE_*` env vars (see `config.py`). Defaults match the
@@ -226,6 +255,7 @@ previous behavior, so no config is needed for a standard install.
 python benchmark.py /tmp/oc-voice-last.wav            # in-process simulation
 python benchmark.py --socket /tmp/oc-voice-last.wav   # through the live daemon
 python benchmark.py --socket --cancel-test clip.wav   # CANCEL responsiveness
+python benchmark.py --compare clip.wav                # FINAL_ONLY vs PARTIALS
 ```
 
 Reports audio duration, partial count, first-partial latency, final latency
@@ -246,7 +276,8 @@ logged server-side).
 | `microphone unavailable` in log | Neither `parec` (pipewire-pulse) nor `arecord` could open the mic; `pactl set-source-mute @DEFAULT_SOURCE@ 0`, check `pactl info` |
 | CUDA lib errors | `LD_LIBRARY_PATH` is exported before Python starts (daemon wrapper, stop script, benchmark re-exec); plus CPU fallback |
 | CUDA unavailable at runtime | Daemon logs `cuda failed…, using cpu` and keeps serving — slower, same protocol |
-| VRAM pressure (2GB cards) | One resident `small.en` int8 (~650MB); partial windows are bounded (8s) so cost stays flat |
+| ASR error mid-session (e.g. CUDA failure) | Session returns an `error` message instead of hanging; the daemon stays up and the next press works |
+| VRAM pressure (2GB cards) | One resident `small.en` int8 (~650MB, ~820MiB total with CUDA workspace, flat across sessions); partial windows are bounded (4s) so cost stays flat |
 | Empty transcript | Silence-only rooms return empty by design (no GPU wake). Otherwise: mic muted, or speak 2–3s starting ~0.5s after pressing |
 | "You said (unsure)" notification | Confidence below threshold (`low_confidence_threshold`, 0.55) — text still typed, just flagged. Tune or disable via `[transcription]` / `OC_VOICE_LOW_CONF` |
 | `opencode: command not found` in log | Hyprland exec has a minimal PATH; script uses the absolute `$HOME/.opencode/bin/opencode` |

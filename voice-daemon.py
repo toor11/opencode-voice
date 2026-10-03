@@ -40,6 +40,7 @@ import time
 import numpy as np
 
 import proto
+from audio_buffer import AudioBuffer
 from config import load as load_config
 from config import resolve_socket
 from normalizer import normalize, rules_from_config
@@ -176,10 +177,24 @@ class Session:
 
     The reader NEVER blocks on the model: it only moves bytes and control
     messages. All blocking ASR runs on the worker. CANCEL is therefore
-    answered by the reader in milliseconds even mid-transcribe; the worker
-    sees the cancel event and suppresses any late result (the connection is
-    closed anyway, and request state dies with the session, so request B can
-    never receive request A's text).
+    answered by the reader in milliseconds even mid-transcribe.
+
+    Two cancellation levels (see README):
+
+    * logical (always): generation bump + cancel event. Any inference that
+      finishes under a stale generation has its output discarded -- a late
+      result can never reach this or a later session.
+    * compute: NOT available. faster-whisper/CTranslate2 expose no
+      interruption API; ``transcribe()`` is a blocking C++ call that a
+      Python Event cannot preempt. The worker therefore never starts new
+      work once cancelled, but an in-flight call runs to completion and is
+      discarded. No worker-process isolation: reloading small.en costs
+      ~2.2s and risks dual VRAM residency on the 2GB card.
+
+    ASR scheduling: FINAL_ONLY by default (one inference per utterance).
+    Optional LOW_COST_PARTIAL transcribes a small bounded window on a
+    cadence, skipping whenever the model is busy (at most one pending
+    partial, coalesced) and never delaying the final.
     """
 
     def __init__(self, server: VoiceServer, conn: socket.socket):
@@ -190,10 +205,11 @@ class Session:
         self.rid = "?"
         self.sr = int(self.cfg["audio"]["sample_rate"])
         st = self.cfg["streaming"]
-        self.streaming = bool(st.get("enabled", True))
+        self.streaming = bool(st.get("enabled", False))
         self.interval = float(st["interval_ms"]) / 1000.0
         self.window_s = float(st["window_s"])
         self.min_new = float(st["min_new_speech_s"])
+        self.max_pending = int(st.get("max_pending", 1))
         self.vad_on = bool(self.cfg["vad"]["enabled"])
         self.vad_min_speech = float(self.cfg["vad"]["min_speech_s"])
         self.trim_save = float(self.cfg["vad"]["trim_savings_s"])
@@ -203,33 +219,45 @@ class Session:
         self.cancel_ok = bool(self.cfg.get("cancellation", {}).get(
             "enabled", True))
 
-        self.chunks: list = []
-        self.buffered = 0
-        self.buf_lock = threading.Lock()
+        self.buf = AudioBuffer(
+            self.sr, float(self.cfg["audio"].get("max_buffer_s", 120.0)))
         self.send_lock = threading.Lock()
         self.cancel_ev = threading.Event()
         self.stop_ev = threading.Event()
         self.done_ev = threading.Event()
+        # Generation: bumped on STOP (final job) and CANCEL. Every ASR job
+        # captures the current generation; output from a stale generation
+        # is discarded before any send.
+        self.generation = 0
+        self.gen_lock = threading.Lock()
         self.t_start = time.monotonic()
         self.t_stop: float | None = None
+        self.t_cancel: float | None = None
         self.last_partial_text = ""
-        self.last_partial_end = 0
+        self.last_partial_end = 0  # samples consumed by partials
         self.n_partials = 0
+        self.partial_asr_s = 0.0
         self.t_first_partial: float | None = None
 
     # -- helpers ---------------------------------------------------------
     def log(self, msg: str) -> None:
         print(f"[voice] request={self.rid} {msg}", flush=True)
 
+    def asr_log(self, msg: str) -> None:
+        print(f"[ASR] {msg} generation={self.generation}", flush=True)
+
     def send(self, obj: dict) -> None:
         with self.send_lock:
             proto.send_json(self.conn, obj)
 
-    def snapshot(self) -> np.ndarray:
-        with self.buf_lock:
-            if not self.chunks:
-                return np.zeros(0, np.float32)
-            return np.concatenate(self.chunks)
+    def bump_generation(self) -> int:
+        with self.gen_lock:
+            self.generation += 1
+            return self.generation
+
+    def current_generation(self) -> int:
+        with self.gen_lock:
+            return self.generation
 
     def finalize_text(self, text: str) -> tuple[str, int]:
         return normalize(text, self.norm_rules)
@@ -319,10 +347,7 @@ class Session:
                 return
             if kind == proto.FRAME_AUDIO:
                 if payload and not self.stop_ev.is_set():
-                    with self.buf_lock:
-                        self.chunks.append(
-                            proto.s16_bytes_to_float32(payload))
-                        self.buffered += len(self.chunks[-1])
+                    self.buf.append(proto.s16_bytes_to_float32(payload))
                 continue
             try:
                 cmsg = proto.loads(payload)
@@ -350,8 +375,9 @@ class Session:
                 if self.stop_ev.is_set():
                     continue  # duplicate stop; worker already finalizing
                 self.t_stop = time.monotonic()
-                audio_s = self.buffered / self.sr
+                audio_s = self.buf.seconds
                 self.log(f"stop ({audio_s:.2f}s audio)")
+                self.bump_generation()  # the final job owns this generation
                 self.stop_ev.set()
             elif ctype == "cancel":
                 self._do_cancel()
@@ -371,79 +397,134 @@ class Session:
         if not self.cancel_ok:
             # Cancellation disabled: treat as STOP (still finalize).
             self.t_stop = time.monotonic()
+            self.bump_generation()
             self.stop_ev.set()
             return
+        t0 = time.monotonic()
+        self.t_cancel = t0
+        self.bump_generation()  # invalidate any in-flight ASR output
         self.cancel_ev.set()
         self.stop_ev.set()
         try:
             self.send({"type": "cancelled", "request_id": self.rid})
         except OSError:
             pass
-        self.log("cancelled")
+        dt = (time.monotonic() - t0) * 1000
+        self.log(f"cancelled (reaction {dt:.0f} ms)")
         self.done_ev.set()
 
     # -- worker: the only thread that touches the model -------------------
+    #
+    # Scheduling policy (single worker => at most one inference at a time,
+    # max_pending=1 by construction; extra triggers coalesce into the next
+    # tick instead of queueing):
+    #   FINAL_ONLY (streaming.enabled=false, the default): wait for STOP,
+    #     run exactly one final inference. Zero GPU work while speaking.
+    #   LOW_COST_PARTIAL: every interval, if enough NEW speech arrived AND
+    #     the model is idle, transcribe the bounded tail window. If the model
+    #     is busy (or a final is pending) the tick is SKIPPED, never queued,
+    #     and never delays the final.
     def _worker(self) -> None:
-        from vad_gate import analyze_array, speech_spans
+        # Never let an ASR exception (CUDA failure, corrupt audio, ...) kill
+        # the thread silently: the reader would wait on done_ev forever and
+        # the busy slot would wedge. Report error, release the session.
+        try:
+            self._worker_loop()
+        except Exception as e:
+            self.asr_log(f"worker failed: {e}")
+            try:
+                self.send({"type": "error", "request_id": self.rid,
+                           "message": "transcription failed"})
+            except OSError:
+                pass
+            self.done_ev.set()
 
-        win_samples = int(self.window_s * self.sr)
+    def _worker_loop(self) -> None:
+        if not self.streaming:
+            self.asr_log("mode=FINAL_ONLY waiting for STOP")
+            while not self.stop_ev.is_set():
+                if self.cancel_ev.is_set():
+                    return
+                if self.stop_ev.wait(self.interval):
+                    break
+            if self.cancel_ev.is_set():
+                return
+            self._finalize(self.current_generation())
+            return
+        self.asr_log(
+            f"mode=LOW_COST_PARTIAL window={self.window_s:.1f}s "
+            f"interval={self.interval * 1000:.0f}ms")
         while not self.stop_ev.is_set():
             if self.cancel_ev.is_set():
                 return
             if self.stop_ev.wait(self.interval):
                 break
-            if self.cancel_ev.is_set() or not self.streaming:
-                continue
-            with self.buf_lock:
-                new = self.buffered - self.last_partial_end
-                tail = (np.concatenate(self.chunks)[-win_samples:]
-                        if self.chunks else None)
-            if new < int(self.min_new * self.sr) or tail is None \
-                    or not len(tail):
-                continue
-            try:
-                if self.vad_on:
-                    v = analyze_array(tail, self.sr, self.tr.vad_options,
-                                      self.vad_min_speech)
-                    if not v.has_speech:
-                        continue
-                    tail_end = len(tail) / self.sr
-                    if not any(tail_end - s["end"] <= RECENT_SPEECH_S
-                               for s in v.segments):
-                        continue
-                text, conf, _segs = self.tr.transcribe_confident(tail)
-            except Exception as e:
-                self.log(f"partial failed: {e}")
-                continue
-            with self.buf_lock:
-                self.last_partial_end = self.buffered
-            if self.cancel_ev.is_set():
-                return
-            if text and text != self.last_partial_text:
-                text, _n = self.finalize_text(text)
-                if text == self.last_partial_text:
-                    continue
-                self.last_partial_text = text
-                self.n_partials += 1
-                if self.t_first_partial is None:
-                    self.t_first_partial = time.monotonic()
-                    fp = self.t_first_partial - self.t_start
-                    self.log(f"first_partial={fp:.2f}s confidence={conf}")
-                try:
-                    self.send({"type": "partial", "request_id": self.rid,
-                               "text": text, "confidence": conf})
-                except OSError:
-                    return
+            if self.cancel_ev.is_set() or self.stop_ev.is_set():
+                continue  # final has priority; never start a stale partial
+            self._maybe_partial()
         if self.cancel_ev.is_set():
             return
-        self._finalize()
+        self._finalize(self.current_generation())
 
-    def _finalize(self) -> None:
+    def _maybe_partial(self) -> None:
+        from vad_gate import analyze_array
+
+        if self.tr.busy.is_set():
+            self.asr_log("partial skipped: ASR busy")
+            return
+        new = len(self.buf) - self.last_partial_end
+        if new < int(self.min_new * self.sr):
+            return
+        gen = self.current_generation()
+        tail = self.buf.tail(self.window_s)
+        if not len(tail):
+            return
+        self.asr_log(f"partial start duration={len(tail) / self.sr:.1f}s")
+        try:
+            if self.vad_on:
+                v = analyze_array(tail, self.sr, self.tr.vad_options,
+                                  self.vad_min_speech)
+                if not v.has_speech:
+                    return
+                tail_end = len(tail) / self.sr
+                if not any(tail_end - s["end"] <= RECENT_SPEECH_S
+                           for s in v.segments):
+                    return
+            t0 = time.monotonic()
+            text, conf, _segs = self.tr.transcribe_confident(tail)
+            dt = time.monotonic() - t0
+        except Exception as e:
+            self.asr_log(f"partial failed: {e}")
+            return
+        self.partial_asr_s += dt
+        self.asr_log(f"partial complete elapsed={dt:.2f}s")
+        self.last_partial_end = len(self.buf)
+        if gen != self.current_generation() or self.cancel_ev.is_set():
+            self.asr_log("stale result discarded")
+            return
+        if text and text != self.last_partial_text:
+            text, _n = self.finalize_text(text)
+            if text == self.last_partial_text:
+                return
+            self.last_partial_text = text
+            self.n_partials += 1
+            if self.t_first_partial is None:
+                self.t_first_partial = time.monotonic()
+                fp = self.t_first_partial - self.t_start
+                self.log(f"first_partial={fp:.2f}s confidence={conf}")
+            try:
+                self.send({"type": "partial", "request_id": self.rid,
+                           "text": text, "confidence": conf})
+            except OSError:
+                return
+
+    def _finalize(self, gen: int) -> None:
         from vad_gate import analyze_array, speech_spans
 
         assert self.t_stop is not None
+        self.asr_log("final start")
         try:
-            audio = self.snapshot()
+            audio = self.buf.full()  # single copy, once per session
             duration_s = len(audio) / self.sr
             t0 = time.monotonic()
             text, conf, segments = "", None, []
@@ -470,12 +551,16 @@ class Session:
                 vad_s, vad_only = 0.0, False
             asr_s = 0.0
             if not vad_only:
-                if self.cancel_ev.is_set():
+                if gen != self.current_generation() \
+                        or self.cancel_ev.is_set():
+                    self.asr_log("stale result discarded")
                     return
                 t1 = time.monotonic()
                 text, conf, segments = self.tr.transcribe_confident(audio)
                 asr_s = time.monotonic() - t1
-            if self.cancel_ev.is_set():
+                self.asr_log(f"final complete elapsed={asr_s:.2f}s")
+            if gen != self.current_generation() or self.cancel_ev.is_set():
+                self.asr_log("stale result discarded")
                 return  # cancelled mid-ASR: never emit a late result
             text, n_norm = self.finalize_text(text)
             t_done = time.monotonic()
@@ -485,6 +570,10 @@ class Session:
                     round(self.t_first_partial - self.t_start, 2)
                     if self.t_first_partial else None),
                 "partials": self.n_partials,
+                "partials_enabled": self.streaming,
+                "partial_window_s": self.window_s,
+                "partial_interval_ms": int(self.interval * 1000),
+                "partial_asr_s": round(self.partial_asr_s, 2),
                 "vad_s": round(vad_s, 2),
                 "asr_s": round(asr_s, 2),
                 "finalization_s": round(t_done - self.t_stop, 2),
@@ -503,6 +592,10 @@ class Session:
                            "timings": timings})
             except OSError:
                 pass
+            # Free the busy slot the moment the result is out: the GPU is
+            # idle now, and a rapid re-press must not meet a stale "busy".
+            # (run() releases again as backup; release is idempotent.)
+            self.server._busy_release(self.rid)
         finally:
             self.done_ev.set()
 

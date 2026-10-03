@@ -89,6 +89,11 @@ class Transcriber:
         self.model = model
         self.cfg = cfg
         self.lock = threading.Lock()
+        # Set while inside a blocking model call (partial OR final, either
+        # path). Lets the partial scheduler skip instead of queueing a
+        # second inference on the same GPU model. Never waited on while
+        # holding any other lock.
+        self.busy = threading.Event()
         self.vad_options = options_from_config(cfg)
         t = cfg["transcription"]
         self.language = t["language"]
@@ -98,15 +103,19 @@ class Transcriber:
 
     def transcribe(self, audio: np.ndarray):
         """Raw segments (list) for one float32 mono 16kHz array."""
-        with self.lock:
-            segments, _ = self.model.transcribe(
-                np.asarray(audio, dtype=np.float32),
-                language=self.language,
-                beam_size=self.beam_size,
-                vad_filter=True,
-                initial_prompt=self.initial_prompt,
-            )
-            return list(segments)
+        self.busy.set()
+        try:
+            with self.lock:
+                segments, _ = self.model.transcribe(
+                    np.asarray(audio, dtype=np.float32),
+                    language=self.language,
+                    beam_size=self.beam_size,
+                    vad_filter=True,
+                    initial_prompt=self.initial_prompt,
+                )
+                return list(segments)
+        finally:
+            self.busy.clear()
 
     def transcribe_array(self, audio: np.ndarray) -> str:
         """Backwards-compatible plain-text transcribe (legacy path)."""

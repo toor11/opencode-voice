@@ -78,6 +78,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--cancel-test", action="store_true",
                     help="measure CANCEL -> CANCELLED reaction through the "
                          "live daemon (needs --socket)")
+    ap.add_argument("--compare", action="store_true",
+                    help="run FINAL_ONLY and LOW_COST_PARTIAL back to back "
+                         "on the same audio (in-process)")
     args = ap.parse_args(argv)
     ensure_cuda_libs()
 
@@ -95,11 +98,58 @@ def main(argv: list[str] | None = None) -> int:
         if args.cancel_test:
             return run_cancel_test(cfg, audio, args.chunk_ms)
         return run_socket(cfg, args.wav, audio, audio_s, args.chunk_ms)
+    if args.compare:
+        return run_compare(cfg, audio, audio_s, args.chunk_ms)
     return run_inprocess(cfg, audio, audio_s, args.chunk_ms)
 
 
+def vram_used() -> str:
+    """Best-effort VRAM snapshot (nvidia-smi), else 'n/a'."""
+    import shutil
+    import subprocess
+
+    if not shutil.which("nvidia-smi"):
+        return "n/a"
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.used",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=10)
+        return f"{out.stdout.strip()} MiB" if out.returncode == 0 else "n/a"
+    except Exception:
+        return "n/a"
+
+
+def run_compare(cfg: dict, audio: np.ndarray, audio_s: float,
+                chunk_ms: int) -> int:
+    """FINAL_ONLY vs LOW_COST_PARTIAL on identical audio, one table."""
+    import copy
+
+    print(f"VRAM before: {vram_used()}")
+    off = copy.deepcopy(cfg)
+    off["streaming"]["enabled"] = False
+    print("\n== A: FINAL_ONLY ==")
+    ra = run_inprocess(off, audio, audio_s, chunk_ms, quiet=True)
+    on = copy.deepcopy(cfg)
+    on["streaming"]["enabled"] = True
+    on["streaming"]["interval_ms"] = 3000
+    on["streaming"]["window_s"] = 4.0
+    on["streaming"]["min_new_speech_s"] = 2.0
+    print("\n== B: LOW_COST_PARTIAL ==")
+    rb = run_inprocess(on, audio, audio_s, chunk_ms, quiet=True)
+    print("\n== compare ==")
+    print(f"VRAM after: {vram_used()}")
+    for label, r in (("FINAL_ONLY", ra), ("PARTIAL", rb)):
+        print(f"{label}: compute={r['compute_s']:.2f}s "
+              f"asr_calls={r['asr_calls']} partials={r['partials']} "
+              f"final={r['final_s']:.2f}s conf={r['final_conf']} "
+              f"text={r['text']!r}")
+    print("Partials cost extra inference; they never change the final.")
+    return 0
+
+
 def run_inprocess(cfg: dict, audio: np.ndarray, audio_s: float,
-                  chunk_ms: int) -> int:
+                  chunk_ms: int, quiet: bool = False) -> int | dict:
     import importlib.util
     import os
     import sys
@@ -138,7 +188,9 @@ def run_inprocess(cfg: dict, audio: np.ndarray, audio_s: float,
     n_partials = 0
     confs: list = []
     compute_s = 0.0
+    asr_calls = 0
     total = len(audio)
+    do_partials = bool(cfg["streaming"].get("enabled", False))
 
     # Simulate paced arrival: process chunk-by-chunk, attempt a partial every
     # interval of (simulated) audio time -- but measure only compute time.
@@ -146,7 +198,7 @@ def run_inprocess(cfg: dict, audio: np.ndarray, audio_s: float,
     while buffered < total:
         buffered = min(total, buffered + chunk)
         sim_t = buffered / sr_len(cfg)
-        if sim_t >= next_partial_at:
+        if do_partials and sim_t >= next_partial_at:
             next_partial_at += interval
             if buffered - last_partial_end < int(min_new * sr_len(cfg)):
                 continue
@@ -159,11 +211,13 @@ def run_inprocess(cfg: dict, audio: np.ndarray, audio_s: float,
                 continue
             t1 = time.monotonic()
             text, conf, _segs = tr.transcribe_confident(tail)
+            asr_calls += 1
             compute_s += time.monotonic() - t1
             last_partial_end = buffered
             if text and first_partial is None:
                 first_partial = compute_s
-                print(f'Partial #{n_partials + 1}: "{text}" (conf={conf})')
+                if not quiet:
+                    print(f'Partial #{n_partials + 1}: "{text}" (conf={conf})')
             if text:
                 n_partials += 1
                 confs.append(conf)
@@ -178,11 +232,17 @@ def run_inprocess(cfg: dict, audio: np.ndarray, audio_s: float,
             audio = np.concatenate([audio[s["start"]:s["end"]] for s in spans])
         t1 = time.monotonic()
         text, final_conf, _segs = tr.transcribe_confident(audio)
+        asr_calls += 1
         final_s = time.monotonic() - t1
     else:
         text, final_s = "", 0.0
     compute_s += final_s
 
+    stats = {"compute_s": compute_s, "asr_calls": asr_calls,
+             "partials": n_partials, "final_s": final_s,
+             "final_conf": final_conf, "text": text}
+    if quiet:
+        return stats
     print(f'Transcript: "{text}"')
     report(audio_s, compute_s, first_partial, final_s, n_partials,
            confs, final_conf)
