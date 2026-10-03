@@ -220,6 +220,7 @@ Then `hyprctl reload` and confirm with
 |---|---|
 | `voice-start.sh` | Key-press: launch streamer, stop any playing reply |
 | `voice-stop.sh` | Key-release: STOP the stream, wait for result, ask/type, speak (legacy branch kept under `OC_VOICE_LEGACY=1`) |
+| `voice-cmd.sh` | Spoken command dispatcher: transcript → safe registry parser → whitelisted app launch (exit 0 = handled, 1 = normal delivery) |
 | `voice-auto.sh` | Hands-free: single press, streamer self-endpoints on silence, then the normal release path |
 | `voice_stream.py` | Socket client: mic (`parec`→`arecord`) → PCM frames; SIGUSR1=STOP, SIGTERM=cancel, `--auto` endpoints locally |
 | `voice-daemon.py` + `voice-daemon.sh` | Persistent model server: socket IPC + chunked ASR + VAD gate + confidence + normalization + cancellation (`--legacy-file-mode` re-enables the WAV spool) |
@@ -236,6 +237,42 @@ Then `hyprctl reload` and confirm with
 | `clean_for_speech.py` | Strips code blocks/URLs/markdown before TTS (900-char cap) |
 | `hypr-voice.conf` | Documentation of the binds (real binds live in `hyprland.lua`) |
 | `voices/` | Piper voice files (gitignored, see install) |
+
+## Voice commands
+
+Certain phrases run an action instead of being sent to OpenCode:
+
+```text
+Open FireDragon          (also "open firefox" -- this is Garuda)
+Launch Brave
+Start Chromium
+Open VS Code
+Open OpenCode and start working   (kitty in ~/Projects running opencode)
+```
+
+Matching is deterministic, not NLU: after normalization the text must be
+`[please] (open|launch|start|run) [the] <app>` (or one exact
+full-phrase command), matched against a registry of app aliases.
+`"tell me about firefox"` or `"fix firefox"` are not commands and go to
+OpenCode normally.
+
+Security: the transcript never defines what executes. `voice-cmd.sh`
+resolves speech to a registered target and only runs the registered
+executable (verified with `command -v` first). Arbitrary shell commands
+are intentionally unsupported -- there is no `eval`, no `sh -c`, no
+substitution of transcript text. Saying `"open firefox"` when it is not
+installed reports "not installed" instead of launching another browser.
+
+Adding an app is one line in `voice-cmd.sh`:
+
+```bash
+register_app vscode "VS Code" code "vscode|vs code|visual studio code"
+```
+
+(canonical name, display name, executable, `|`-separated aliases), then
+`open vscode` / `open vs code` / `launch visual studio code` work. Test
+with `OC_VOICE_DRYRUN=1 ./voice-cmd.sh "open vscode"` and add cases to
+`tests/test_commands.py`.
 
 ## Configuration
 
