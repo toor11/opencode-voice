@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: README / Setup
+    url: https://github.com/toor11/opencode-voice/blob/main/README.md
+    about: Read the project documentation before opening a new issue.
+  - name: Contributing guide
+    url: https://github.com/toor11/opencode-voice/blob/main/CONTRIBUTING.md
+    about: Setup and contribution instructions for contributors.
