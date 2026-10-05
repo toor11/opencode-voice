@@ -6,7 +6,7 @@
 # (parec/arecord) and streams PCM to the daemon over the Unix socket.
 # Legacy: OC_VOICE_LEGACY=1 keeps the old pw-record-to-wav behavior.
 set -u
-export PATH="/home/user/.local/bin:/usr/bin:/bin"
+export PATH="$HOME/.local/bin:/usr/bin:/bin"
 DIR="$(cd "$(dirname "$0")" && pwd)"
 # Mic can come back muted after a reboot; ensure it is live on every press.
 pactl set-source-mute @DEFAULT_SOURCE@ 0 2>/dev/null || true

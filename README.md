@@ -174,7 +174,7 @@ with `opencode session list` from `~/Projects`.
 - Garuda/Arch Linux, Hyprland (Wayland), PipeWire, `wtype`, `parec` (mic
   streaming; `arecord` fallback), `pw-play`
 - Python 3.12 venv (see install), NVIDIA GPU optional (GTX 1050 2GB tested)
-- OpenCode CLI on PATH (`~/.opencode/bin/opencode`)
+- OpenCode CLI on PATH (`~/.opencode/bin/opencode`; set `OC_VOICE_OPENCODE` to use a different location)
 - No new Python dependencies: socket client/config/tests use stdlib + numpy
   (stdlib `tomllib` reads the config; Python ≥3.11 required for that)
 
