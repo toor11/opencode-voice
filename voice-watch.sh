@@ -6,7 +6,7 @@
 set -u
 SPOOL=/tmp/oc-voice
 SESF=$SPOOL/voice.session
-OPENCODE_BIN="/home/user/.opencode/bin/opencode"
+OPENCODE_BIN="${OC_VOICE_OPENCODE:-$HOME/.opencode/bin/opencode}"
 # Same pinned project dir as voice-stop.sh ask mode (OC_VOICE_DIR wins).
 VOICE_DIR="${OC_VOICE_DIR:-$HOME/Projects}"
 

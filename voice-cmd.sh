@@ -20,7 +20,7 @@
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-OPENCODE_BIN="/home/user/.opencode/bin/opencode"
+OPENCODE_BIN="${OC_VOICE_OPENCODE:-$HOME/.opencode/bin/opencode}"
 PROJECTS_DIR="$HOME/Projects"
 
 log() { echo "$(date '+%H:%M:%S') cmd: $*" >> /tmp/oc-voice.log; }

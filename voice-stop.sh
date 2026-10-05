@@ -6,7 +6,7 @@
 # wait for the daemon's result, then run the unchanged deliver pipeline.
 # Legacy: OC_VOICE_LEGACY=1 keeps the old stop-capture + spool behavior.
 set -u
-export PATH="/home/user/.opencode/bin:/home/user/.local/bin:/usr/bin:/bin"
+export PATH="$HOME/.opencode/bin:$HOME/.local/bin:/usr/bin:/bin"
 # CUDA runtime ships as pip wheels inside the venv; the loader only honors
 # LD_LIBRARY_PATH when set before the python process starts.
 shopt -s nullglob
@@ -20,7 +20,7 @@ if [ "${#_NVLIBS[@]}" -gt 0 ]; then
 fi
 
 LOG=/tmp/oc-voice.log
-OPENCODE_BIN="/home/user/.opencode/bin/opencode"
+OPENCODE_BIN="${OC_VOICE_OPENCODE:-$HOME/.opencode/bin/opencode}"
 MODE="${OC_VOICE_MODE:-ask}"   # ask | type
 
 log() { echo "$(date '+%H:%M:%S') $*" >> "$LOG"; }

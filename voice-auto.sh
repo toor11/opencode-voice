@@ -7,7 +7,7 @@
 # END_SILENCE is fixed in voice_stream.py (--end-silence 1.2 default);
 # NO_SPEECH_TIMEOUT / MAX_HOLD via env below.
 set -u
-export PATH="/home/user/.opencode/bin:/home/user/.local/bin:/usr/bin:/bin"
+export PATH="$HOME/.opencode/bin:$HOME/.local/bin:/usr/bin:/bin"
 DIR="$(cd "$(dirname "$0")" && pwd)"
 SPOOL=/tmp/oc-voice
 LOG=/tmp/oc-voice.log
